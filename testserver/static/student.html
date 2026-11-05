@@ -71,11 +71,22 @@ async function startScreen(msg){
 /* ---------- тест ---------- */
 function beginTest(r){
   A = {id: r.attempt_id, qs: r.questions, pos: 0}; sendQ = Promise.resolve();
-  endAt = performance.now() + r.remaining*1000; finished = false;
+  syncTimer(r.remaining); finished = false;
   clearInterval(tick); tick = setInterval(drawTimer, 250); drawTimer(); renderQ();
 }
+// время ведёт сервер; Date.now (а не performance.now) продолжает идти и во время
+// сна ноутбука, а при возврате на вкладку остаток сверяется с сервером
+function syncTimer(remaining){ endAt = Date.now() + remaining*1000; }
+document.addEventListener("visibilitychange", async () => {
+  if (document.hidden || finished || !A) return;
+  try {
+    const r = await api("/api/attempt/" + encodeURIComponent(A.id));
+    if (finished) return;
+    if (r.finished){ finished = true; clearInterval(tick); showResult(r); } else syncTimer(r.remaining);
+  } catch(e){}
+});
 function drawTimer(){
-  const s = Math.max(0, Math.ceil((endAt - performance.now())/1000));
+  const s = Math.max(0, Math.ceil((endAt - Date.now())/1000));
   $("timer").textContent = `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
   $("timer").className = "timer" + (s <= 60 ? " low" : "");
   if (s <= 0 && !finished) finish(true);
@@ -112,7 +123,8 @@ async function sendAnswer(t, live){
   if (!t.pending) return;
   const choice = t.chosen;
   try {
-    await api(`/api/attempt/${A.id}/answer`, {idx:t.idx, choice});
+    const r = await api(`/api/attempt/${A.id}/answer`, {idx:t.idx, choice});
+    if (live && r && typeof r.remaining === "number") syncTimer(r.remaining);
     if (t.chosen === choice) t.pending = false;
   } catch(e){
     if (e.status === 409){ if (live) finish(); return; }

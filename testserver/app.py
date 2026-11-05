@@ -6,6 +6,8 @@
 не передаются.
 """
 import csv
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -32,7 +34,6 @@ COLS = {
     "adm": "Административная коллегия",
     "bank": "Банкротная коллегия",
 }
-LETTERS = ["А", "Б", "В", "Г"]
 DEFAULTS = {
     "title": "Тест по постановлениям Пленумов ВС РФ и ВАС РФ",
     "count": 10,          # вопросов в одной попытке
@@ -44,18 +45,20 @@ DEFAULTS = {
     "open": True,         # тест открыт для прохождения
 }
 GRACE = 3                 # секунд на доставку последнего ответа после дедлайна
+QID_RE = re.compile(r"^[\w.-]{1,40}$")   # номер вопроса: попадает в адрес /api/admin/questions/<id>
 _rnd = random.SystemRandom()
 
 
 def _secret():
     p = os.path.join(DATA, "secret.key")
-    if not os.path.exists(p):
-        with open(p, "w") as f:
+    try:
+        # O_EXCL: файл создаётся один раз и сразу с правами 0600
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        with os.fdopen(fd, "w") as f:
             f.write(secrets.token_hex(32))
-        try:
-            os.chmod(p, 0o600)
-        except OSError:
-            pass
     with open(p) as f:
         return f.read().strip()
 
@@ -93,6 +96,7 @@ CREATE TABLE IF NOT EXISTS items(
   PRIMARY KEY(attempt_id, idx), FOREIGN KEY(attempt_id) REFERENCES attempts(id) ON DELETE CASCADE);
 CREATE INDEX IF NOT EXISTS ix_attempts_name ON attempts(name_key);
 CREATE INDEX IF NOT EXISTS ix_items_qid ON items(qid);
+CREATE INDEX IF NOT EXISTS ix_attempts_open ON attempts(finished, deadline);
 """
 
 
@@ -101,6 +105,7 @@ def db():
         g.db = sqlite3.connect(DB_PATH, timeout=30)
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA foreign_keys=ON")
+        g.db.execute("PRAGMA synchronous=NORMAL")  # в режиме WAL безопасно и заметно быстрее
     return g.db
 
 
@@ -130,7 +135,10 @@ def init_db():
     con = sqlite3.connect(DB_PATH, timeout=30)
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript(SCHEMA)
-    if con.execute("SELECT COUNT(*) FROM blocks").fetchone()[0] == 0:
+    # начальный банк загружается только в новую базу; если администратор позже
+    # очистит банк, при перезапуске он не должен «воскреснуть»
+    seeded = con.execute("SELECT 1 FROM settings WHERE k='seeded'").fetchone() is not None
+    if not seeded and con.execute("SELECT COUNT(*) FROM blocks").fetchone()[0] == 0:
         seed = os.path.join(BASE, "seed_bank.json")
         if os.path.exists(seed):
             with open(seed, encoding="utf-8") as f:
@@ -142,6 +150,7 @@ def init_db():
                 con.execute("INSERT INTO questions(id,block_id,q,opts,ans,act,pt,expl) VALUES(?,?,?,?,?,?,?,?)",
                             (q["id"], q["b"], q["q"], json.dumps(q["o"], ensure_ascii=False), q["a"],
                              q.get("act", ""), q.get("p", ""), q.get("e", "")))
+    con.execute("INSERT OR IGNORE INTO settings(k,v) VALUES('seeded','true')")
     env_pw = os.environ.get("TEST_ADMIN_PASSWORD")
     if env_pw and con.execute("SELECT 1 FROM settings WHERE k='admin_hash'").fetchone() is None:
         con.execute("INSERT INTO settings(k,v) VALUES('admin_hash',?)", (generate_password_hash(env_pw),))
@@ -162,10 +171,21 @@ def _s(v):
     return "" if v is None else str(v)
 
 
+def _int(v, lo=0, hi=2**31 - 1):
+    """Целое в границах или None (большие числа иначе роняют запрос к SQLite)."""
+    if isinstance(v, bool):
+        return None
+    try:
+        v = int(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return v if lo <= v <= hi else None
+
+
 # -------------------------------------------------------------------- настройки
 def get_settings():
     s = dict(DEFAULTS)
-    for r in db().execute("SELECT k,v FROM settings WHERE k!='admin_hash'"):
+    for r in db().execute("SELECT k,v FROM settings WHERE k NOT IN ('admin_hash','seeded')"):
         try:
             s[r["k"]] = json.loads(r["v"])
         except ValueError:
@@ -177,13 +197,12 @@ def put_settings(d):
     out = {}
     title = _s(d.get("title", DEFAULTS["title"])).strip()[:200] or DEFAULTS["title"]
     out["title"] = title
+    names = {"count": "Вопросов в одной попытке", "minutes": "Время на попытку",
+             "max_attempts": "Попыток на одну фамилию"}
     for key, lo, hi in (("count", 1, 200), ("minutes", 1, 300), ("max_attempts", 0, 100)):
-        try:
-            v = int(d.get(key, DEFAULTS[key]))
-        except (TypeError, ValueError):
-            raise ValueError("Поле «%s» должно быть числом" % key)
-        if not lo <= v <= hi:
-            raise ValueError("Поле «%s»: допустимо от %d до %d" % (key, lo, hi))
+        v = _int(d.get(key, DEFAULTS[key]), lo, hi)
+        if v is None:
+            raise ValueError("Поле «%s»: целое число от %d до %d" % (names[key], lo, hi))
         out[key] = v
     if d.get("review") not in ("full", "score"):
         raise ValueError("Режим результата: full или score")
@@ -193,10 +212,10 @@ def put_settings(d):
     if not cols:
         raise ValueError("Выберите хотя бы один вариант входа")
     out["cols"] = cols
-    try:
-        out["blocks"] = sorted({int(x) for x in raw_blocks})
-    except (TypeError, ValueError):
+    blocks = [_int(x) for x in raw_blocks] if isinstance(raw_blocks, list) else [None]
+    if None in blocks:
         raise ValueError("Неверный список блоков")
+    out["blocks"] = sorted(set(blocks))
     out["open"] = bool(d.get("open", True))
     con = db()
     for k, v in out.items():
@@ -233,12 +252,16 @@ def pool_sizes(blocks):
     return sizes
 
 
-def pool_rows(col, blocks):
+def _in(n):
+    return ",".join("?" * n)
+
+
+def pool_ids(col, blocks):
+    """Номера вопросов направления (без текстов: тексты нужны только выбранным)."""
     ids = _block_ids(col, blocks)
     if not ids:
         return []
-    return db().execute("SELECT id,block_id,q,opts,ans,act,pt,expl FROM questions WHERE block_id IN (%s)"
-                        % ",".join("?" * len(ids)), ids).fetchall()
+    return [r[0] for r in db().execute("SELECT id FROM questions WHERE block_id IN (%s)" % _in(len(ids)), ids)]
 
 
 # --------------------------------------------------------------------- вход админа
@@ -246,27 +269,51 @@ _fails = {}
 _fails_lock = threading.Lock()
 
 
-def admin_required(f):
-    @wraps(f)
-    def wrapper(*a, **kw):
-        if not session.get("admin"):
-            return jerr("Требуется вход администратора", 401)
-        if request.method not in ("GET", "HEAD") and request.headers.get("X-Test-Client") != "1":
-            return jerr("Недопустимый запрос", 400)
-        return f(*a, **kw)
-    return wrapper
-
-
 def admin_hash():
     r = db().execute("SELECT v FROM settings WHERE k='admin_hash'").fetchone()
     return r["v"] if r else None
 
 
+def _pw_tag(h):
+    """Отпечаток текущего пароля в сессии: после смены или сброса пароля
+    (в том числе через reset_admin.py) все прежние входы перестают действовать."""
+    return hashlib.sha256(h.encode()).hexdigest()[:32] if h else None
+
+
+def _set_admin(h):
+    session.clear()
+    session["admin"] = _pw_tag(h)
+
+
+def is_admin():
+    tag = session.get("admin")
+    return isinstance(tag, str) and hmac.compare_digest(tag, _pw_tag(admin_hash()) or "")
+
+
+def _csrf_ok():
+    # заголовок нельзя выставить простой формой или ссылкой с чужого сайта
+    return request.method in ("GET", "HEAD") or request.headers.get("X-Test-Client") == "1"
+
+
+def admin_required(f):
+    @wraps(f)
+    def wrapper(*a, **kw):
+        if not is_admin():
+            return jerr("Требуется вход администратора", 401)
+        if not _csrf_ok():
+            return jerr("Недопустимый запрос", 400)
+        return f(*a, **kw)
+    return wrapper
+
+
 @app.after_request
 def _headers(resp):
-    resp.headers["Cache-Control"] = "no-store"
+    # стили можно кешировать с проверкой; страницы и API — никогда
+    resp.headers["Cache-Control"] = "no-cache" if request.path.startswith("/static/") else "no-store"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "same-origin"
+    resp.headers["X-Frame-Options"] = "DENY"  # страницы нельзя встроить в чужой сайт (кликджекинг)
+    resp.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
     return resp
 
 
@@ -322,11 +369,16 @@ def api_start():
     if col not in COLS or col not in s["cols"]:
         return jerr("Недопустимый вариант входа")
     key = name.casefold()
-    pool = pool_rows(col, set(s["blocks"]))
+    pool = pool_ids(col, set(s["blocks"]))
     if not pool:
         return jerr("В выбранном направлении нет вопросов", 400)
     # случайные вопросы и порядок вариантов; правильный ответ остаётся только на сервере
-    chosen = _rnd.sample(pool, min(s["count"], len(pool)))
+    picked = _rnd.sample(pool, min(s["count"], len(pool)))
+    rows = {r["id"]: r for r in db().execute(
+        "SELECT id,q,opts,ans,act,pt,expl FROM questions WHERE id IN (%s)" % _in(len(picked)), picked)}
+    chosen = [rows[i] for i in picked if i in rows]  # вопрос мог быть удалён в эту же секунду
+    if not chosen:
+        return jerr("В выбранном направлении нет вопросов", 400)
     aid = secrets.token_urlsafe(18)
     items, public = [], []
     for i, r in enumerate(chosen):
@@ -429,14 +481,10 @@ def api_answer(aid):
         _finalize(a)
         return jsonify({"finished": True}), 409
     d = request.get_json(silent=True) or {}
-    try:
-        idx = int(d.get("idx"))
-        choice = d.get("choice")
-        choice = None if choice is None else int(choice)
-    except (TypeError, ValueError):
+    idx = _int(d.get("idx"), 0, 999)
+    choice = None if d.get("choice") is None else _int(d.get("choice"), 0, 3)
+    if idx is None or (choice is None and d.get("choice") is not None):
         return jerr("Неверные данные")
-    if choice is not None and not 0 <= choice <= 3:
-        return jerr("Неверный вариант")
     # условие на попытку в том же запросе: ответ не попадёт в уже закрытую попытку
     cur = db().execute("UPDATE items SET chosen=? WHERE attempt_id=? AND idx=? AND EXISTS("
                        "SELECT 1 FROM attempts WHERE id=? AND finished IS NULL)", (choice, aid, idx, aid))
@@ -460,27 +508,32 @@ def api_finish(aid):
 # ------------------------------------------------------------------ API админа
 @app.get("/api/admin/me")
 def admin_me():
-    return jsonify({"configured": admin_hash() is not None, "authed": bool(session.get("admin"))})
+    return jsonify({"configured": admin_hash() is not None, "authed": is_admin()})
 
 
 @app.post("/api/admin/setup")
 def admin_setup():
+    if not _csrf_ok():
+        return jerr("Недопустимый запрос", 400)
     if admin_hash() is not None:
         return jerr("Пароль уже задан", 403)
     pw = _s((request.get_json(silent=True) or {}).get("password"))
     if len(pw) < 6:
         return jerr("Пароль не короче 6 символов")
     # INSERT OR IGNORE + rowcount: два одновременных запроса не перезапишут пароль друг друга
-    cur = db().execute("INSERT OR IGNORE INTO settings(k,v) VALUES('admin_hash',?)", (generate_password_hash(pw),))
+    h = generate_password_hash(pw)
+    cur = db().execute("INSERT OR IGNORE INTO settings(k,v) VALUES('admin_hash',?)", (h,))
     db().commit()
     if cur.rowcount == 0:
         return jerr("Пароль уже задан", 403)
-    session["admin"] = True
+    _set_admin(h)
     return jsonify({"ok": True})
 
 
 @app.post("/api/admin/login")
 def admin_login():
+    if not _csrf_ok():
+        return jerr("Недопустимый запрос", 400)
     ip = request.remote_addr or "?"
     with _fails_lock:
         n, until = _fails.get(ip, (0, 0))
@@ -491,7 +544,7 @@ def admin_login():
     if h and check_password_hash(h, pw):
         with _fails_lock:
             _fails.pop(ip, None)
-        session["admin"] = True
+        _set_admin(h)
         return jsonify({"ok": True})
     with _fails_lock:
         n, _ = _fails.get(ip, (0, 0))  # перечитать: счётчик мог измениться параллельным запросом
@@ -504,6 +557,8 @@ def admin_login():
 
 @app.post("/api/admin/logout")
 def admin_logout():
+    if not _csrf_ok():
+        return jerr("Недопустимый запрос", 400)
     session.clear()
     return jsonify({"ok": True})
 
@@ -517,8 +572,10 @@ def admin_password():
         return jerr("Текущий пароль неверный", 403)
     if len(new) < 6:
         return jerr("Новый пароль не короче 6 символов")
-    db().execute("UPDATE settings SET v=? WHERE k='admin_hash'", (generate_password_hash(new),))
+    h = generate_password_hash(new)
+    db().execute("UPDATE settings SET v=? WHERE k='admin_hash'", (h,))
     db().commit()
+    _set_admin(h)  # этот вход остаётся, остальные сессии закрываются
     return jsonify({"ok": True})
 
 
@@ -586,9 +643,23 @@ def admin_block_update(bid):
 def admin_block_delete(bid):
     if db().execute("SELECT 1 FROM questions WHERE block_id=? LIMIT 1", (bid,)).fetchone():
         return jerr("В блоке есть вопросы: сначала удалите или перенесите их", 409)
-    db().execute("DELETE FROM blocks WHERE id=?", (bid,))
-    db().commit()
+    with tx() as con:
+        con.execute("DELETE FROM blocks WHERE id=?", (bid,))
+        _prune_block_filter(con)
     return jsonify({"ok": True})
+
+
+def _prune_block_filter(con):
+    """Убрать из настроек удалённые блоки. Иначе, если были отмечены только они,
+    фильтр перестаёт совпадать с чем-либо и тест молча остаётся без вопросов."""
+    r = con.execute("SELECT v FROM settings WHERE k='blocks'").fetchone()
+    if not r:
+        return
+    sel = json.loads(r["v"])
+    alive = {x[0] for x in con.execute("SELECT id FROM blocks")}
+    kept = [b for b in sel if b in alive]
+    if kept != sel:
+        con.execute("UPDATE settings SET v=? WHERE k='blocks'", (json.dumps(kept),))
 
 
 # --- вопросы
@@ -607,17 +678,11 @@ def _clean_question(d):
         errs.append("заполните все четыре варианта")
     elif len(set(o)) < 4:
         errs.append("варианты не должны повторяться")
-    try:
-        a = int(d.get("a"))
-        if not 0 <= a <= 3:
-            raise ValueError
-    except (TypeError, ValueError):
+    a = _int(d.get("a"), 0, 3)
+    if a is None:
         errs.append("отметьте правильный вариант")
         a = 0
-    try:
-        b = int(d.get("b"))
-    except (TypeError, ValueError):
-        b = None
+    b = _int(d.get("b"))
     if b is None or not db().execute("SELECT 1 FROM blocks WHERE id=?", (b,)).fetchone():
         errs.append("выберите блок")
     return errs, {"q": q, "o": o, "a": a, "b": b, "act": _s(d.get("act")).strip(),
@@ -718,24 +783,24 @@ def admin_import():
     # сначала полная проверка и нормализация, затем запись одной транзакцией
     blocks = []
     for b in d["blocks"]:
-        try:
-            bid = int(b["id"])
-        except (TypeError, ValueError, KeyError):
+        bid = _int(b.get("id")) if isinstance(b, dict) else None
+        if bid is None:
             return jerr("Неверная запись блока: %s" % (b.get("id") if isinstance(b, dict) else "?"))
         title = _s(b.get("title") or b.get("t")).strip()[:300] or "Блок %d" % bid
         blocks.append((bid, title, json.dumps(_clean_cols(b.get("cols") if "cols" in b else b.get("col")))))
     qs = []
     for q in d["questions"]:
-        bad = jerr("Неверная запись вопроса: %s" % (q.get("id") if isinstance(q, dict) else "?"))
-        if not (isinstance(q, dict) and q.get("id") and q.get("q") and isinstance(q.get("o"), list)
-                and len(q["o"]) == 4 and type(q.get("a")) is int and 0 <= q["a"] <= 3):
-            return bad
-        try:
-            bid = int(q.get("b"))
-        except (TypeError, ValueError):
-            return bad
-        qs.append((_s(q["id"]).strip(), bid, _s(q["q"]), json.dumps([_s(x) for x in q["o"]], ensure_ascii=False),
-                   q["a"], _s(q.get("act")), _s(q.get("p")), _s(q.get("e"))))
+        if not isinstance(q, dict):
+            return jerr("Неверная запись вопроса: ?")
+        qid, bid, opts = _s(q.get("id")).strip(), _int(q.get("b")), q.get("o")
+        if not (QID_RE.match(qid) and _s(q.get("q")).strip() and bid is not None and isinstance(opts, list)
+                and len(opts) == 4 and all(_s(x).strip() for x in opts) and type(q.get("a")) is int
+                and 0 <= q["a"] <= 3):
+            return jerr("Неверная запись вопроса: %s" % (qid or "?"))
+        qs.append((qid, bid, _s(q["q"]).strip(), json.dumps([_s(x).strip() for x in opts], ensure_ascii=False),
+                   q["a"], _s(q.get("act")).strip(), _s(q.get("p")).strip(), _s(q.get("e")).strip()))
+    if len({x[0] for x in qs}) != len(qs):
+        return jerr("В файле повторяются номера вопросов")
     added = updated = 0
     with tx() as con:
         if mode == "replace":
@@ -751,6 +816,7 @@ def admin_import():
                         "ans=excluded.ans,act=excluded.act,pt=excluded.pt,expl=excluded.expl", row)
             updated += exists
             added += not exists
+        _prune_block_filter(con)
     return jsonify({"added": added, "updated": updated})
 
 
@@ -835,6 +901,11 @@ def admin_csv():
                     r["seconds"] if done else "", "да" if r["timeout"] else "нет", "завершён" if done else "не завершён"])
     return Response("\ufeff" + buf.getvalue(), mimetype="text/csv; charset=utf-8",
                     headers={"Content-Disposition": "attachment; filename=rezultaty.csv"})
+
+
+@app.errorhandler(OverflowError)
+def _overflow(_e):
+    return jerr("Слишком большое число в запросе")
 
 
 init_db()
