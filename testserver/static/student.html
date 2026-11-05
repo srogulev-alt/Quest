@@ -17,6 +17,12 @@ const LET = ["А","Б","В","Г"];
 const esc = s => String(s==null?"":s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const KEY = "plenum-attempt-id";
 let CFG = null, A = null, tick = null, endAt = 0, finished = true;
+let sendQ = Promise.resolve();   // ответы уходят на сервер строго по очереди
+const ls = {   // localStorage может быть недоступен (приватный режим, запрет сайта)
+  get: k => { try { return localStorage.getItem(k); } catch(e){ return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch(e){} },
+  del: k => { try { localStorage.removeItem(k); } catch(e){} },
+};
 
 async function api(path, body){
   const opt = {cache:"no-store"};
@@ -35,7 +41,8 @@ async function startScreen(msg){
   catch(e){ $("app").innerHTML = `<p class="err">${esc(e.message)}. Обновите страницу.</p>`; return; }
   $("ttl").textContent = CFG.title; document.title = CFG.title;
   if (!CFG.open){ $("app").innerHTML = `<div class="start"><p class="big">Тест сейчас закрыт.</p><p class="note">Обратитесь к администратору.</p></div>`; return; }
-  const last = localStorage.getItem("plenum-name") || "";
+  if (!CFG.cols.length){ $("app").innerHTML = `<div class="start"><p class="big">В тесте пока нет доступных вопросов.</p><p class="note">Обратитесь к администратору.</p></div>`; return; }
+  const last = ls.get("plenum-name") || "";
   $("app").innerHTML = `
     <div class="start">
       <p class="big">Выберите направление. В тесте вопросов: ${CFG.count}, время: ${CFG.minutes} мин. Вопросы и порядок ответов подбираются случайно.</p>
@@ -47,6 +54,7 @@ async function startScreen(msg){
       <p class="note">Правильные ответы хранятся на сервере. Когда время выйдет, тест завершится автоматически; вопросы без ответа засчитываются как неверные.${CFG.max_attempts?` Попыток на одну фамилию: ${CFG.max_attempts}.`:""}</p>
       <p class="err" id="err" role="alert">${esc(msg||"")}</p>
     </div>`;
+  $("nm").onkeydown = e => { if (e.key === "Enter") $("go").click(); };
   $("go").onclick = async () => {
     const nm = $("nm").value.trim(); const sel = document.querySelector("input[name=col]:checked");
     $("err").textContent = "";
@@ -54,7 +62,7 @@ async function startScreen(msg){
     $("go").disabled = true;
     try {
       const r = await api("/api/start", {name:nm, col:sel.value});
-      localStorage.setItem("plenum-name", nm); localStorage.setItem(KEY, r.attempt_id);
+      ls.set("plenum-name", nm); ls.set(KEY, r.attempt_id);
       beginTest(r);
     } catch(e){ $("err").textContent = e.message; $("go").disabled = false; }
   };
@@ -62,7 +70,7 @@ async function startScreen(msg){
 
 /* ---------- тест ---------- */
 function beginTest(r){
-  A = {id: r.attempt_id, qs: r.questions, pos: 0};
+  A = {id: r.attempt_id, qs: r.questions, pos: 0}; sendQ = Promise.resolve();
   endAt = performance.now() + r.remaining*1000; finished = false;
   clearInterval(tick); tick = setInterval(drawTimer, 250); drawTimer(); renderQ();
 }
@@ -92,22 +100,40 @@ function renderQ(){
     finish(false);
   };
 }
-async function choose(i){
+function choose(i){
   if (finished) return;
-  const t = A.qs[A.pos]; t.chosen = i; renderQ();
-  try { await api(`/api/attempt/${A.id}/answer`, {idx:t.idx, choice:i}); }
-  catch(e){
-    if (e.status === 409){ finish(true); return; }
-    const el = $("neterr"); if (el) el.textContent = "Ответ пока не отправлен на сервер: " + e.message + ". Он будет отправлен при завершении.";
-    t.pending = true;
+  const t = A.qs[A.pos]; if (t.chosen === i) return;
+  t.chosen = i; t.pending = true; renderQ();
+  // очередь: при быстрой смене ответа запросы не обгоняют друг друга,
+  // и на сервере остаётся последний выбранный вариант
+  sendQ = sendQ.then(() => sendAnswer(t, true));
+}
+async function sendAnswer(t, live){
+  if (!t.pending) return;
+  const choice = t.chosen;
+  try {
+    await api(`/api/attempt/${A.id}/answer`, {idx:t.idx, choice});
+    if (t.chosen === choice) t.pending = false;
+  } catch(e){
+    if (e.status === 409){ if (live) finish(); return; }
+    const el = live && !finished && $("neterr");
+    if (el) el.textContent = "Ответ пока не отправлен на сервер: " + e.message + ". Он будет отправлен при завершении.";
   }
 }
 async function finish(){
   if (finished) return; finished = true; clearInterval(tick); $("timer").textContent = "";
+  $("app").innerHTML = `<p class="note">Сохранение результата…</p>`;
+  await submit();
+}
+async function submit(){
+  await sendQ;
   // доотправить неподтверждённые ответы
-  for (const t of A.qs){ if (t.pending && t.chosen !== null){ try { await api(`/api/attempt/${A.id}/answer`, {idx:t.idx, choice:t.chosen}); } catch(e){} } }
+  for (const t of A.qs) await sendAnswer(t, false);
   try { showResult(await api(`/api/attempt/${A.id}/finish`, {})); }
-  catch(e){ $("app").innerHTML = `<p class="err">${esc(e.message)}</p><div class="row"><button class="primary" id="retry">Повторить</button></div>`; finished = false; $("retry").onclick = () => { finished = false; finish(); }; }
+  catch(e){
+    $("app").innerHTML = `<p class="err">${esc(e.message)}</p><div class="row"><button class="primary" id="retry">Повторить</button></div>`;
+    $("retry").onclick = () => { $("retry").disabled = true; submit(); };
+  }
 }
 
 /* ---------- результат ---------- */
@@ -130,28 +156,38 @@ function showResult(r){
     <h2>${r.score} из ${r.total}</h2>
     <p class="sub">${r.timeout?"Время вышло. ":""}Затрачено ${Math.floor(r.seconds/60)} мин ${r.seconds%60} с. Результат сохранён на сервере.</p>
     <div class="row"><button class="primary" id="again">Пройти ещё раз</button></div>${body}</div>`;
-  $("again").onclick = () => { localStorage.removeItem(KEY); startScreen(); };
+  $("again").onclick = () => { ls.del(KEY); A = null; startScreen(); };
   window.scrollTo(0,0);
 }
 
 document.addEventListener("keydown", e => {
   if (finished || !A) return;
   if (["INPUT","TEXTAREA","SELECT"].includes(document.activeElement.tagName)) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (e.key >= "1" && e.key <= "4"){ if (+e.key-1 < A.qs[A.pos].options.length) choose(+e.key-1); }
   if (e.key === "ArrowRight" && A.pos < A.qs.length-1){ A.pos++; renderQ(); }
   if (e.key === "ArrowLeft" && A.pos > 0){ A.pos--; renderQ(); }
 });
 
+// предупредить, если страницу закрывают до отправки ответа на сервер
+window.addEventListener("beforeunload", e => {
+  if (A && !finished && A.qs.some(t => t.pending)){ e.preventDefault(); e.returnValue = ""; }
+});
+
 /* ---------- запуск и возобновление после обновления страницы ---------- */
 (async function boot(){
-  const id = localStorage.getItem(KEY);
+  const id = ls.get(KEY);
   if (id){
     try {
-      const r = await api("/api/attempt/" + id);
+      const r = await api("/api/attempt/" + encodeURIComponent(id));
       if (r.finished){ showResult(r); return; }
       try { const c = await api("/api/public"); $("ttl").textContent = c.title; document.title = c.title; } catch(e){}
       beginTest(r); return;
-    } catch(e){ localStorage.removeItem(KEY); }
+    } catch(e){
+      // забываем попытку, только если сервер её не знает; при сбое сети её можно будет продолжить
+      if (e.status === 404) ls.del(KEY);
+      else if (e.net){ $("app").innerHTML = `<p class="err">${esc(e.message)}. Обновите страницу, чтобы продолжить тест.</p>`; return; }
+    }
   }
   startScreen();
 })();

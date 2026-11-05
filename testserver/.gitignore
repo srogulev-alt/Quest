@@ -1,0 +1,4 @@
+data/
+venv/
+wheels/
+__pycache__/

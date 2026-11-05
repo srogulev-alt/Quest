@@ -23,18 +23,26 @@ const mmss = s => s==null ? "—" : Math.floor(s/60)+":"+String(s%60).padStart(2
 async function api(path, method, body){
   const opt = {method: method||"GET", headers:{"X-Test-Client":"1"}, cache:"no-store"};
   if (body !== undefined){ opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
-  const r = await fetch(path, opt); let j = null;
+  let r, j = null;
+  try { r = await fetch(path, opt); } catch(e){ throw new Error("Нет связи с сервером"); }
   try { j = await r.json(); } catch(e){}
   if (r.status === 401 && path !== "/api/admin/login"){ gate(); throw new Error("Требуется вход"); }
   if (!r.ok) throw new Error((j && j.error) || ("Ошибка " + r.status));
   return j;
 }
-const msg = (t, ok) => { const el = $("msg"); if (el){ el.className = ok ? "note" : "err"; el.textContent = t; } };
+const msg = (t, ok) => { const el = $("msg"); if (el){ el.className = ok ? "note" : "err"; el.textContent = t; } else if (!ok) alert(t); };
+// ошибки обработчиков (сеть, сервер) не должны пропадать молча
+window.addEventListener("unhandledrejection", e => {
+  const m = e.reason && e.reason.message;
+  if (m && m !== "Требуется вход"){ e.preventDefault(); msg(m); }
+});
 
 /* ---------- вход ---------- */
 async function gate(){
   $("tabs").hidden = true; $("who").textContent = "";
-  const me = await fetch("/api/admin/me",{cache:"no-store"}).then(r=>r.json());
+  let me;
+  try { me = await api("/api/admin/me"); }
+  catch(e){ $("app").innerHTML = `<p class="err">${esc(e.message)}. Обновите страницу.</p>`; return; }
   if (!me.configured) return setupScreen();
   if (!me.authed) return loginScreen();
   $("tabs").hidden = false; $("who").innerHTML = `<button id="out">Выйти</button>`;
@@ -43,7 +51,7 @@ async function gate(){
 }
 function setupScreen(){
   $("app").innerHTML = `<div class="start"><h2>Первый запуск: задайте пароль администратора</h2>
-    <p class="note">Пароль защищает редактор вопросов, настройки и результаты. Не короче 6 символов. Восстановить его нельзя, но администратор сервера может сбросить его, удалив запись из базы (см. README).</p>
+    <p class="note">Пароль защищает редактор вопросов, настройки и результаты. Не короче 6 символов. Восстановить его нельзя, но администратор сервера может задать новый командой <code>python reset_admin.py НОВЫЙ_ПАРОЛЬ</code> (см. README).</p>
     <div class="box"><label class="f" for="p1">Пароль</label><input type="password" id="p1" autocomplete="new-password">
       <label class="f" for="p2">Повторите пароль</label><input type="password" id="p2" autocomplete="new-password">
       <div class="err" id="msg" role="alert"></div><div class="row"><button class="primary" id="ok">Сохранить пароль</button></div></div></div>`;
@@ -66,7 +74,8 @@ function show(t){
   $("tabs").innerHTML = TABS.map(([k,n]) => `<button data-t="${k}" class="${k===t?"on":""}">${n}</button>`).join("") +
     `<a class="right" href="/" target="_blank" rel="noopener"><button>Открыть тест ↗</button></a>`;
   document.querySelectorAll("#tabs [data-t]").forEach(b => b.onclick = () => show(b.dataset.t));
-  ({q:qList,b:blocksScreen,s:settingsScreen,r:resultsScreen})[t]();
+  ({q:qList,b:blocksScreen,s:settingsScreen,r:resultsScreen})[t]()
+    .catch(e => { if (e.message !== "Требуется вход") $("app").innerHTML = `<p class="err">${esc(e.message)}</p>`; });
 }
 
 /* ---------- вопросы ---------- */
@@ -98,13 +107,14 @@ async function qList(){
   $("imp").onclick = () => { mode = "merge"; $("file").click(); };
   $("impAll").onclick = () => { if (confirm("Все текущие вопросы будут заменены содержимым файла. Результаты не изменятся. Продолжить?")){ mode = "replace"; $("file").click(); } };
   $("file").onchange = async e => {
-    const f = e.target.files[0]; if (!f) return;
+    const f = e.target.files[0]; e.target.value = ""; if (!f) return;
     try { const d = JSON.parse(await f.text()); const r = await api("/api/admin/import?mode="+mode,"POST",d);
       await qList(); msg(`Импорт: добавлено ${r.added}, обновлено ${r.updated}.`, true); } catch(err){ msg("Не удалось импортировать: " + err.message); }
   };
 }
 async function qForm(id){
   await loadBlocks();
+  if (!BLOCKS.length){ alert("Сначала создайте блок на вкладке «Коллегии и блоки»."); return; }
   const q = id ? await api("/api/admin/questions/" + encodeURIComponent(id)) : {id:"", b:QF.block||BLOCKS[0].id, q:"", o:["","","",""], a:0, act:"", p:"", e:""};
   $("app").innerHTML = `<h2>${id?"Вопрос "+esc(q.id):"Новый вопрос"}</h2><div class="form">
     <label class="f" for="fb">Блок</label><select id="fb">${BLOCKS.map(b=>`<option value="${b.id}">${b.id}. ${esc(b.title)}</option>`).join("")}</select>
@@ -144,9 +154,10 @@ async function blocksScreen(){
     b.cols = [...document.querySelectorAll(`[data-b="${b.id}"]:checked`)].map(x => x.dataset.c);
     await api("/api/admin/blocks/"+b.id,"PUT",{cols:b.cols}); sum();
   });
-  document.querySelectorAll("[data-t]").forEach(el => el.onchange = async () => { await api("/api/admin/blocks/"+el.dataset.t,"PUT",{title:el.value}); });
+  document.querySelectorAll("input[data-t]").forEach(el => el.onchange = async () => { await api("/api/admin/blocks/"+el.dataset.t,"PUT",{title:el.value}); });
   document.querySelectorAll("[data-d]").forEach(el => el.onclick = async () => { if (confirm("Удалить пустой блок?")){ await api("/api/admin/blocks/"+el.dataset.d,"DELETE"); blocksScreen(); } });
   $("addb").onclick = async () => { if (!$("nt").value.trim()) return msg("Введите название блока."); await api("/api/admin/blocks","POST",{title:$("nt").value, cols:["civ","adm","bank"]}); blocksScreen(); };
+  $("nt").onkeydown = e => { if (e.key === "Enter") $("addb").click(); };
 }
 
 /* ---------- настройки ---------- */

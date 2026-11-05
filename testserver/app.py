@@ -9,11 +9,13 @@ import csv
 import io
 import json
 import os
+import random
 import re
 import secrets
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from functools import wraps
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory, session
@@ -42,6 +44,7 @@ DEFAULTS = {
     "open": True,         # тест открыт для прохождения
 }
 GRACE = 3                 # секунд на доставку последнего ответа после дедлайна
+_rnd = random.SystemRandom()
 
 
 def _secret():
@@ -53,7 +56,8 @@ def _secret():
             os.chmod(p, 0o600)
         except OSError:
             pass
-    return open(p).read().strip()
+    with open(p) as f:
+        return f.read().strip()
 
 
 app = Flask(__name__, static_folder=os.path.join(BASE, "static"), static_url_path="/static")
@@ -64,6 +68,11 @@ app.config.update(
     MAX_CONTENT_LENGTH=20 * 1024 * 1024,
 )
 app.json.ensure_ascii = False
+if os.environ.get("TRUST_PROXY") == "1":
+    # за обратным прокси (nginx, Caddy): брать IP участника из X-Forwarded-For,
+    # иначе блокировка входа и журнал IP работают по адресу прокси
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 
 
 # ----------------------------------------------------------------- база данных
@@ -93,6 +102,21 @@ def db():
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA foreign_keys=ON")
     return g.db
+
+
+@contextmanager
+def tx():
+    """Транзакция с блокировкой на запись: проверка и изменение выполняются атомарно."""
+    con = db()
+    if con.in_transaction:
+        con.commit()
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        yield con
+    except BaseException:
+        con.rollback()
+        raise
+    con.commit()
 
 
 @app.teardown_appcontext
@@ -133,6 +157,11 @@ def jerr(msg, code=400):
     return jsonify({"error": msg}), code
 
 
+def _s(v):
+    """Строка из произвольного значения JSON (None -> '')."""
+    return "" if v is None else str(v)
+
+
 # -------------------------------------------------------------------- настройки
 def get_settings():
     s = dict(DEFAULTS)
@@ -146,7 +175,7 @@ def get_settings():
 
 def put_settings(d):
     out = {}
-    title = str(d.get("title", DEFAULTS["title"])).strip()[:200] or DEFAULTS["title"]
+    title = _s(d.get("title", DEFAULTS["title"])).strip()[:200] or DEFAULTS["title"]
     out["title"] = title
     for key, lo, hi in (("count", 1, 200), ("minutes", 1, 300), ("max_attempts", 0, 100)):
         try:
@@ -159,11 +188,15 @@ def put_settings(d):
     if d.get("review") not in ("full", "score"):
         raise ValueError("Режим результата: full или score")
     out["review"] = d["review"]
-    cols = [c for c in d.get("cols", []) if c in COLS]
+    raw_cols, raw_blocks = d.get("cols"), d.get("blocks") or []
+    cols = [c for c in COLS if isinstance(raw_cols, list) and c in raw_cols]
     if not cols:
         raise ValueError("Выберите хотя бы один вариант входа")
     out["cols"] = cols
-    out["blocks"] = sorted({int(x) for x in d.get("blocks", [])})
+    try:
+        out["blocks"] = sorted({int(x) for x in raw_blocks})
+    except (TypeError, ValueError):
+        raise ValueError("Неверный список блоков")
     out["open"] = bool(d.get("open", True))
     con = db()
     for k, v in out.items():
@@ -173,18 +206,39 @@ def put_settings(d):
     return out
 
 
-def pool_rows(col, blocks):
-    rows = db().execute(
-        "SELECT q.id,q.block_id,q.q,q.opts,q.ans,q.act,q.pt,q.expl,b.cols FROM questions q "
-        "JOIN blocks b ON b.id=q.block_id").fetchall()
+def _block_ids(col, blocks):
+    """Номера блоков, входящих в направление col (с учётом фильтра blocks)."""
     out = []
-    for r in rows:
-        if blocks and r["block_id"] not in blocks:
+    for r in db().execute("SELECT id,cols FROM blocks"):
+        if blocks and r["id"] not in blocks:
             continue
         if col != "mix" and col not in json.loads(r["cols"]):
             continue
-        out.append(r)
+        out.append(r["id"])
     return out
+
+
+def pool_sizes(blocks):
+    """Число вопросов по каждому направлению одним проходом по таблицам."""
+    counts = {r[0]: r[1] for r in db().execute("SELECT block_id,COUNT(*) FROM questions GROUP BY block_id")}
+    sizes = dict.fromkeys(COLS, 0)
+    for r in db().execute("SELECT id,cols FROM blocks"):
+        if blocks and r["id"] not in blocks:
+            continue
+        n = counts.get(r["id"], 0)
+        bc = json.loads(r["cols"])
+        for c in COLS:
+            if c == "mix" or c in bc:
+                sizes[c] += n
+    return sizes
+
+
+def pool_rows(col, blocks):
+    ids = _block_ids(col, blocks)
+    if not ids:
+        return []
+    return db().execute("SELECT id,block_id,q,opts,ans,act,pt,expl FROM questions WHERE block_id IN (%s)"
+                        % ",".join("?" * len(ids)), ids).fetchall()
 
 
 # --------------------------------------------------------------------- вход админа
@@ -231,24 +285,19 @@ def page_admin():
 @app.get("/api/public")
 def api_public():
     s = get_settings()
-    cols = []
-    for c in COLS:
-        if c in s["cols"]:
-            n = len(pool_rows(c, set(s["blocks"])))
-            if n:
-                cols.append({"id": c, "title": COLS[c], "n": n})
+    sizes = pool_sizes(set(s["blocks"]))
+    cols = [{"id": c, "title": COLS[c], "n": sizes[c]} for c in COLS if c in s["cols"] and sizes[c]]
     return jsonify({"title": s["title"], "count": s["count"], "minutes": s["minutes"],
                     "open": s["open"], "max_attempts": s["max_attempts"], "cols": cols,
                     "review": s["review"]})
 
 
 def _norm_name(name):
-    return re.sub(r"\s+", " ", (name or "").strip())
+    return re.sub(r"\s+", " ", name.strip()) if isinstance(name, str) else ""
 
 
 def _attempt_or_404(aid):
-    a = db().execute("SELECT * FROM attempts WHERE id=?", (aid,)).fetchone()
-    return a
+    return db().execute("SELECT * FROM attempts WHERE id=?", (aid,)).fetchone()
 
 
 def _public_items(aid):
@@ -270,55 +319,69 @@ def api_start():
     if len(name) < 3 or len(name) > 80:
         return jerr("Введите фамилию и имя (от 3 до 80 символов)")
     col = d.get("col")
-    if col not in s["cols"] or col not in COLS:
+    if col not in COLS or col not in s["cols"]:
         return jerr("Недопустимый вариант входа")
     key = name.casefold()
-    if s["max_attempts"]:
-        used = db().execute("SELECT COUNT(*) FROM attempts WHERE name_key=?", (key,)).fetchone()[0]
-        if used >= s["max_attempts"]:
-            return jerr("Для этой фамилии исчерпан лимит попыток (%d)" % s["max_attempts"], 403)
     pool = pool_rows(col, set(s["blocks"]))
     if not pool:
         return jerr("В выбранном направлении нет вопросов", 400)
     # случайные вопросы и порядок вариантов; правильный ответ остаётся только на сервере
-    import random
-    rnd = random.SystemRandom()
-    chosen = rnd.sample(pool, min(s["count"], len(pool)))
+    chosen = _rnd.sample(pool, min(s["count"], len(pool)))
     aid = secrets.token_urlsafe(18)
-    t = now()
-    con = db()
-    con.execute("INSERT INTO attempts(id,name,name_key,col,started,deadline,total,review,ip) VALUES(?,?,?,?,?,?,?,?,?)",
-                (aid, name, key, col, t, t + s["minutes"] * 60, len(chosen), s["review"], request.remote_addr))
+    items, public = [], []
     for i, r in enumerate(chosen):
         opts = json.loads(r["opts"])
         order = list(range(4))
-        rnd.shuffle(order)
-        snap = {"q": r["q"], "shown": [opts[k] for k in order], "correct": order.index(r["ans"]),
+        _rnd.shuffle(order)
+        shown = [opts[k] for k in order]
+        snap = {"q": r["q"], "shown": shown, "correct": order.index(r["ans"]),
                 "expl": r["expl"], "act": r["act"], "pt": r["pt"]}
-        con.execute("INSERT INTO items(attempt_id,idx,qid,snap) VALUES(?,?,?,?)",
-                    (aid, i, r["id"], json.dumps(snap, ensure_ascii=False)))
-    con.commit()
+        items.append((aid, i, r["id"], json.dumps(snap, ensure_ascii=False)))
+        public.append({"idx": i, "q": r["q"], "options": shown, "chosen": None})
+    # подсчёт попыток и запись — в одной транзакции, чтобы одновременные
+    # запросы под одной фамилией не обходили лимит
+    with tx() as con:
+        if s["max_attempts"]:
+            used = con.execute("SELECT COUNT(*) FROM attempts WHERE name_key=?", (key,)).fetchone()[0]
+            if used >= s["max_attempts"]:
+                return jerr("Для этой фамилии исчерпан лимит попыток (%d)" % s["max_attempts"], 403)
+        t = now()
+        con.execute("INSERT INTO attempts(id,name,name_key,col,started,deadline,total,review,ip) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (aid, name, key, col, t, t + s["minutes"] * 60, len(chosen), s["review"], request.remote_addr))
+        con.executemany("INSERT INTO items(attempt_id,idx,qid,snap) VALUES(?,?,?,?)", items)
     return jsonify({"attempt_id": aid, "total": len(chosen), "remaining": s["minutes"] * 60,
-                    "name": name, "questions": _public_items(aid)})
+                    "name": name, "questions": public})
 
 
 def _finalize(a):
-    """Проверка ответов и закрытие попытки. Идемпотентна."""
+    """Проверка ответов и закрытие попытки. Идемпотентна и безопасна при
+    одновременных вызовах: всё выполняется в одной транзакции с блокировкой."""
     if a["finished"]:
         return
-    con = db()
-    t = now()
-    score = 0
-    for it in con.execute("SELECT idx,snap,chosen FROM items WHERE attempt_id=?", (a["id"],)).fetchall():
-        sn = json.loads(it["snap"])
-        ok = 1 if it["chosen"] is not None and it["chosen"] == sn["correct"] else 0
-        score += ok
-        con.execute("UPDATE items SET ok=? WHERE attempt_id=? AND idx=?", (ok, a["id"], it["idx"]))
-    timeout = 1 if t >= a["deadline"] else 0
-    seconds = max(0, min(t, a["deadline"]) - a["started"])
-    con.execute("UPDATE attempts SET finished=?,score=?,seconds=?,timeout=? WHERE id=? AND finished IS NULL",
-                (t, score, seconds, timeout, a["id"]))
-    con.commit()
+    with tx() as con:
+        a = con.execute("SELECT * FROM attempts WHERE id=?", (a["id"],)).fetchone()
+        if a is None or a["finished"]:
+            return
+        t = now()
+        score, oks = 0, []
+        for it in con.execute("SELECT idx,snap,chosen FROM items WHERE attempt_id=?", (a["id"],)).fetchall():
+            ok = 1 if it["chosen"] is not None and it["chosen"] == json.loads(it["snap"])["correct"] else 0
+            score += ok
+            oks.append((ok, a["id"], it["idx"]))
+        con.executemany("UPDATE items SET ok=? WHERE attempt_id=? AND idx=?", oks)
+        # попытка, закрытая позже дедлайна (браузер закрыли, ответы не сохранялись),
+        # получает время закрытия = дедлайну
+        finished = min(t, a["deadline"])
+        con.execute("UPDATE attempts SET finished=?,score=?,seconds=?,timeout=? WHERE id=?",
+                    (finished, score, max(0, finished - a["started"]), 1 if t >= a["deadline"] else 0, a["id"]))
+
+
+def _finalize_expired():
+    """Закрыть попытки, брошенные участниками после истечения времени."""
+    rows = db().execute("SELECT * FROM attempts WHERE finished IS NULL AND deadline<?", (now() - GRACE,)).fetchall()
+    for a in rows:
+        _finalize(a)
 
 
 def _result(aid):
@@ -374,9 +437,13 @@ def api_answer(aid):
         return jerr("Неверные данные")
     if choice is not None and not 0 <= choice <= 3:
         return jerr("Неверный вариант")
-    cur = db().execute("UPDATE items SET chosen=? WHERE attempt_id=? AND idx=?", (choice, aid, idx))
+    # условие на попытку в том же запросе: ответ не попадёт в уже закрытую попытку
+    cur = db().execute("UPDATE items SET chosen=? WHERE attempt_id=? AND idx=? AND EXISTS("
+                       "SELECT 1 FROM attempts WHERE id=? AND finished IS NULL)", (choice, aid, idx, aid))
     db().commit()
     if cur.rowcount == 0:
+        if _attempt_or_404(aid)["finished"]:
+            return jsonify({"finished": True}), 409
         return jerr("Вопрос не найден", 404)
     return jsonify({"ok": True, "remaining": max(0, a["deadline"] - t)})
 
@@ -400,11 +467,14 @@ def admin_me():
 def admin_setup():
     if admin_hash() is not None:
         return jerr("Пароль уже задан", 403)
-    pw = (request.get_json(silent=True) or {}).get("password", "")
+    pw = _s((request.get_json(silent=True) or {}).get("password"))
     if len(pw) < 6:
         return jerr("Пароль не короче 6 символов")
-    db().execute("INSERT INTO settings(k,v) VALUES('admin_hash',?)", (generate_password_hash(pw),))
+    # INSERT OR IGNORE + rowcount: два одновременных запроса не перезапишут пароль друг друга
+    cur = db().execute("INSERT OR IGNORE INTO settings(k,v) VALUES('admin_hash',?)", (generate_password_hash(pw),))
     db().commit()
+    if cur.rowcount == 0:
+        return jerr("Пароль уже задан", 403)
     session["admin"] = True
     return jsonify({"ok": True})
 
@@ -417,15 +487,18 @@ def admin_login():
         if until > time.time():
             return jerr("Слишком много попыток. Повторите через минуту", 429)
     h = admin_hash()
-    pw = (request.get_json(silent=True) or {}).get("password", "")
+    pw = _s((request.get_json(silent=True) or {}).get("password"))
     if h and check_password_hash(h, pw):
         with _fails_lock:
             _fails.pop(ip, None)
         session["admin"] = True
         return jsonify({"ok": True})
     with _fails_lock:
+        n, _ = _fails.get(ip, (0, 0))  # перечитать: счётчик мог измениться параллельным запросом
         n += 1
         _fails[ip] = (n, time.time() + 60 if n >= 5 else 0)
+        if len(_fails) > 10000:  # не копить записи бесконечно
+            _fails.clear()
     return jerr("Неверный пароль", 401)
 
 
@@ -439,11 +512,12 @@ def admin_logout():
 @admin_required
 def admin_password():
     d = request.get_json(silent=True) or {}
-    if not check_password_hash(admin_hash(), d.get("old", "")):
+    old, new = _s(d.get("old")), _s(d.get("new"))
+    if not check_password_hash(admin_hash(), old):
         return jerr("Текущий пароль неверный", 403)
-    if len(d.get("new", "")) < 6:
+    if len(new) < 6:
         return jerr("Новый пароль не короче 6 символов")
-    db().execute("UPDATE settings SET v=? WHERE k='admin_hash'", (generate_password_hash(d["new"]),))
+    db().execute("UPDATE settings SET v=? WHERE k='admin_hash'", (generate_password_hash(new),))
     db().commit()
     return jsonify({"ok": True})
 
@@ -473,19 +547,18 @@ def _block_json(r, counts):
 def admin_blocks():
     counts = {r[0]: r[1] for r in db().execute("SELECT block_id,COUNT(*) FROM questions GROUP BY block_id")}
     rows = db().execute("SELECT * FROM blocks ORDER BY id").fetchall()
-    sizes = {c: len(pool_rows(c, set())) for c in COLS}
-    return jsonify({"blocks": [_block_json(r, counts) for r in rows], "totals": sizes})
+    return jsonify({"blocks": [_block_json(r, counts) for r in rows], "totals": pool_sizes(set())})
 
 
 def _clean_cols(v):
-    return [c for c in (v or []) if c in ("civ", "adm", "bank")]
+    return [c for c in ("civ", "adm", "bank") if isinstance(v, list) and c in v]
 
 
 @app.post("/api/admin/blocks")
 @admin_required
 def admin_block_create():
     d = request.get_json(silent=True) or {}
-    title = (d.get("title") or "").strip()
+    title = _s(d.get("title")).strip()
     if not title:
         return jerr("Введите название блока")
     nid = (db().execute("SELECT COALESCE(MAX(id),0) FROM blocks").fetchone()[0]) + 1
@@ -501,7 +574,7 @@ def admin_block_update(bid):
     r = db().execute("SELECT * FROM blocks WHERE id=?", (bid,)).fetchone()
     if not r:
         return jerr("Блок не найден", 404)
-    title = (d.get("title") if "title" in d else r["title"]).strip() or r["title"]
+    title = _s(d.get("title")).strip() or r["title"]
     cols = _clean_cols(d["cols"]) if "cols" in d else json.loads(r["cols"])
     db().execute("UPDATE blocks SET title=?,cols=? WHERE id=?", (title[:300], json.dumps(cols), bid))
     db().commit()
@@ -525,8 +598,8 @@ def _q_json(r):
 
 
 def _clean_question(d):
-    q = (d.get("q") or "").strip()
-    o = [(x or "").strip() for x in (d.get("o") or [])]
+    q = _s(d.get("q")).strip()
+    o = [_s(x).strip() for x in d.get("o")] if isinstance(d.get("o"), list) else []
     errs = []
     if not q:
         errs.append("введите текст вопроса")
@@ -547,8 +620,8 @@ def _clean_question(d):
         b = None
     if b is None or not db().execute("SELECT 1 FROM blocks WHERE id=?", (b,)).fetchone():
         errs.append("выберите блок")
-    return errs, {"q": q, "o": o, "a": a, "b": b, "act": (d.get("act") or "").strip(),
-                  "p": (d.get("p") or "").strip(), "e": (d.get("e") or "").strip()}
+    return errs, {"q": q, "o": o, "a": a, "b": b, "act": _s(d.get("act")).strip(),
+                  "p": _s(d.get("p")).strip(), "e": _s(d.get("e")).strip()}
 
 
 @app.get("/api/admin/questions")
@@ -563,9 +636,14 @@ def admin_questions():
     items = [_q_json(r) for r in rows]
     if text:
         items = [x for x in items if text in (x["q"] + " " + " ".join(x["o"]) + " " + x["act"] + " " + x["p"] + " " + x["id"]).lower()]
-    # естественная сортировка по номеру внутри блока
-    items.sort(key=lambda x: (x["b"], int(x["id"].split("-")[-1]) if x["id"].split("-")[-1].isdigit() else 0, x["id"]))
+    items.sort(key=lambda x: (x["b"], _qnum(x["id"]), x["id"]))
     return jsonify({"total": len(items), "items": items[offset:offset + limit]})
+
+
+def _qnum(qid):
+    """Номер вопроса внутри блока из id вида «12-07» (для естественной сортировки)."""
+    tail = qid.split("-")[-1]
+    return int(tail) if tail.isdigit() else 0
 
 
 @app.get("/api/admin/questions/<qid>")
@@ -582,9 +660,8 @@ def admin_question_create():
     errs, c = _clean_question(d)
     if errs:
         return jerr("Не сохранено: " + "; ".join(errs) + ".")
-    nums = [int(r[0].split("-")[-1]) for r in db().execute("SELECT id FROM questions WHERE block_id=?", (c["b"],))
-            if r[0].split("-")[-1].isdigit()]
-    n = (max(nums) if nums else 0) + 1
+    n = max([_qnum(r[0]) for r in db().execute("SELECT id FROM questions WHERE block_id=?", (c["b"],))],
+            default=0) + 1
     qid = "%d-%02d" % (c["b"], n)
     while db().execute("SELECT 1 FROM questions WHERE id=?", (qid,)).fetchone():
         n += 1
@@ -633,36 +710,47 @@ def admin_export():
 @admin_required
 def admin_import():
     mode = request.args.get("mode", "merge")
-    d = request.get_json(silent=True) or {}
-    blocks, qs = d.get("blocks"), d.get("questions")
-    if not isinstance(blocks, list) or not isinstance(qs, list):
+    if mode not in ("merge", "replace"):
+        return jerr("Неизвестный режим импорта")
+    d = request.get_json(silent=True)
+    if not isinstance(d, dict) or not isinstance(d.get("blocks"), list) or not isinstance(d.get("questions"), list):
         return jerr("Нужен JSON, выгруженный кнопкой «Экспорт»")
-    for q in qs:
+    # сначала полная проверка и нормализация, затем запись одной транзакцией
+    blocks = []
+    for b in d["blocks"]:
+        try:
+            bid = int(b["id"])
+        except (TypeError, ValueError, KeyError):
+            return jerr("Неверная запись блока: %s" % (b.get("id") if isinstance(b, dict) else "?"))
+        title = _s(b.get("title") or b.get("t")).strip()[:300] or "Блок %d" % bid
+        blocks.append((bid, title, json.dumps(_clean_cols(b.get("cols") if "cols" in b else b.get("col")))))
+    qs = []
+    for q in d["questions"]:
+        bad = jerr("Неверная запись вопроса: %s" % (q.get("id") if isinstance(q, dict) else "?"))
         if not (isinstance(q, dict) and q.get("id") and q.get("q") and isinstance(q.get("o"), list)
-                and len(q["o"]) == 4 and isinstance(q.get("a"), int) and 0 <= q["a"] <= 3 and q.get("b") is not None):
-            return jerr("Неверная запись вопроса: %s" % (q.get("id") if isinstance(q, dict) else "?"))
-    con = db()
-    if mode == "replace":
-        con.execute("DELETE FROM questions")
-        con.execute("DELETE FROM blocks")
+                and len(q["o"]) == 4 and type(q.get("a")) is int and 0 <= q["a"] <= 3):
+            return bad
+        try:
+            bid = int(q.get("b"))
+        except (TypeError, ValueError):
+            return bad
+        qs.append((_s(q["id"]).strip(), bid, _s(q["q"]), json.dumps([_s(x) for x in q["o"]], ensure_ascii=False),
+                   q["a"], _s(q.get("act")), _s(q.get("p")), _s(q.get("e"))))
     added = updated = 0
-    for b in blocks:
-        title = b.get("title") or b.get("t") or ("Блок %s" % b.get("id"))
-        cols = _clean_cols(b.get("cols") if "cols" in b else b.get("col"))
-        con.execute("INSERT INTO blocks(id,title,cols) VALUES(?,?,?) ON CONFLICT(id) DO NOTHING",
-                    (int(b["id"]), title, json.dumps(cols)))
-    for q in qs:
-        if not con.execute("SELECT 1 FROM blocks WHERE id=?", (int(q["b"]),)).fetchone():
-            con.execute("INSERT INTO blocks(id,title,cols) VALUES(?,?,?)", (int(q["b"]), "Блок %s" % q["b"], "[]"))
-        exists = con.execute("SELECT 1 FROM questions WHERE id=?", (q["id"],)).fetchone() is not None
-        con.execute("INSERT INTO questions(id,block_id,q,opts,ans,act,pt,expl) VALUES(?,?,?,?,?,?,?,?) "
-                    "ON CONFLICT(id) DO UPDATE SET block_id=excluded.block_id,q=excluded.q,opts=excluded.opts,"
-                    "ans=excluded.ans,act=excluded.act,pt=excluded.pt,expl=excluded.expl",
-                    (q["id"], int(q["b"]), q["q"], json.dumps(q["o"], ensure_ascii=False), q["a"],
-                     q.get("act", ""), q.get("p", ""), q.get("e", "")))
-        updated += exists
-        added += not exists
-    con.commit()
+    with tx() as con:
+        if mode == "replace":
+            con.execute("DELETE FROM questions")
+            con.execute("DELETE FROM blocks")
+        con.executemany("INSERT INTO blocks(id,title,cols) VALUES(?,?,?) ON CONFLICT(id) DO NOTHING", blocks)
+        for row in qs:
+            con.execute("INSERT INTO blocks(id,title,cols) VALUES(?,?,'[]') ON CONFLICT(id) DO NOTHING",
+                        (row[1], "Блок %d" % row[1]))
+            exists = con.execute("SELECT 1 FROM questions WHERE id=?", (row[0],)).fetchone() is not None
+            con.execute("INSERT INTO questions(id,block_id,q,opts,ans,act,pt,expl) VALUES(?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(id) DO UPDATE SET block_id=excluded.block_id,q=excluded.q,opts=excluded.opts,"
+                        "ans=excluded.ans,act=excluded.act,pt=excluded.pt,expl=excluded.expl", row)
+            updated += exists
+            added += not exists
     return jsonify({"added": added, "updated": updated})
 
 
@@ -676,11 +764,14 @@ def _attempt_row(r):
 @app.get("/api/admin/attempts")
 @admin_required
 def admin_attempts():
-    name = (request.args.get("name") or "").strip().casefold()
+    _finalize_expired()
+    name = _norm_name(request.args.get("name")).casefold()
     col = request.args.get("col")
-    rows = db().execute("SELECT * FROM attempts ORDER BY started DESC").fetchall()
-    out = [_attempt_row(r) for r in rows
-           if (not name or name in r["name_key"]) and (not col or r["col"] == col)]
+    sql, args = "SELECT * FROM attempts", ()
+    if col:
+        sql, args = sql + " WHERE col=?", (col,)
+    rows = db().execute(sql + " ORDER BY started DESC", args).fetchall()
+    out = [_attempt_row(r) for r in rows if not name or name in r["name_key"]]
     return jsonify({"total": len(out), "items": out[:1000]})
 
 
@@ -690,6 +781,9 @@ def admin_attempt(aid):
     a = _attempt_or_404(aid)
     if not a:
         return jerr("Попытка не найдена", 404)
+    if not a["finished"] and a["deadline"] + GRACE < now():
+        _finalize(a)
+        a = _attempt_or_404(aid)
     items = []
     for r in db().execute("SELECT idx,qid,snap,chosen,ok FROM items WHERE attempt_id=? ORDER BY idx", (aid,)):
         sn = json.loads(r["snap"])
@@ -709,27 +803,34 @@ def admin_attempt_delete(aid):
 @app.get("/api/admin/stats")
 @admin_required
 def admin_stats():
+    _finalize_expired()
     rows = db().execute(
-        "SELECT i.qid, COUNT(*) n, SUM(CASE WHEN i.ok=0 THEN 1 ELSE 0 END) bad FROM items i "
-        "JOIN attempts a ON a.id=i.attempt_id WHERE a.finished IS NOT NULL GROUP BY i.qid "
-        "HAVING bad>0 ORDER BY (bad*1.0/n) DESC, n DESC LIMIT 15").fetchall()
-    out = []
-    for r in rows:
-        q = db().execute("SELECT q FROM questions WHERE id=?", (r["qid"],)).fetchone()
-        out.append({"qid": r["qid"], "q": q["q"] if q else "(вопрос удалён)", "n": r["n"], "bad": r["bad"]})
+        "SELECT s.qid, s.n, s.bad, q.q FROM ("
+        " SELECT i.qid, COUNT(*) n, SUM(CASE WHEN i.ok=0 THEN 1 ELSE 0 END) bad FROM items i"
+        " JOIN attempts a ON a.id=i.attempt_id WHERE a.finished IS NOT NULL GROUP BY i.qid"
+        " HAVING bad>0 ORDER BY (bad*1.0/n) DESC, n DESC LIMIT 15) s"
+        " LEFT JOIN questions q ON q.id=s.qid ORDER BY (s.bad*1.0/s.n) DESC, s.n DESC").fetchall()
+    out = [{"qid": r["qid"], "q": r["q"] if r["q"] is not None else "(вопрос удалён)", "n": r["n"], "bad": r["bad"]}
+           for r in rows]
     done = db().execute("SELECT COUNT(*), AVG(score*100.0/total) FROM attempts WHERE finished IS NOT NULL").fetchone()
     return jsonify({"hard": out, "attempts": done[0], "avg": round(done[1], 1) if done[1] is not None else None})
+
+
+def _csv_safe(v):
+    """Защита от формул в Excel: фамилию участник вводит сам (например «=HYPERLINK(...)»)."""
+    return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
 
 
 @app.get("/api/admin/results.csv")
 @admin_required
 def admin_csv():
+    _finalize_expired()
     buf = io.StringIO()
     w = csv.writer(buf, delimiter=";", quoting=csv.QUOTE_ALL)
     w.writerow(["Участник", "Направление", "Начало", "Верно", "Всего", "Процент", "Секунд", "Время вышло", "Статус"])
     for r in db().execute("SELECT * FROM attempts ORDER BY started DESC"):
         done = r["finished"] is not None
-        w.writerow([r["name"], COLS.get(r["col"], r["col"]), time.strftime("%d.%m.%Y %H:%M", time.localtime(r["started"])),
+        w.writerow([_csv_safe(r["name"]), COLS.get(r["col"], r["col"]), time.strftime("%d.%m.%Y %H:%M", time.localtime(r["started"])),
                     r["score"] if done else "", r["total"], round(r["score"] * 100 / r["total"]) if done else "",
                     r["seconds"] if done else "", "да" if r["timeout"] else "нет", "завершён" if done else "не завершён"])
     return Response("\ufeff" + buf.getvalue(), mimetype="text/csv; charset=utf-8",
