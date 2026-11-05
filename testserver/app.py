@@ -1,0 +1,749 @@
+# -*- coding: utf-8 -*-
+"""Тест по постановлениям Пленумов ВС РФ и ВАС РФ — клиент-серверная версия.
+
+Сервер на Flask, данные в SQLite (файл data/test.db). Правильные ответы
+хранятся и проверяются только на сервере: до завершения теста они клиенту
+не передаются.
+"""
+import csv
+import io
+import json
+import os
+import re
+import secrets
+import sqlite3
+import threading
+import time
+from functools import wraps
+
+from flask import Flask, Response, g, jsonify, request, send_from_directory, session
+from werkzeug.security import check_password_hash, generate_password_hash
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.environ.get("TEST_DATA_DIR", os.path.join(BASE, "data"))
+os.makedirs(DATA, exist_ok=True)
+DB_PATH = os.path.join(DATA, "test.db")
+
+COLS = {
+    "mix": "Микс (все темы)",
+    "civ": "Гражданская коллегия",
+    "adm": "Административная коллегия",
+    "bank": "Банкротная коллегия",
+}
+LETTERS = ["А", "Б", "В", "Г"]
+DEFAULTS = {
+    "title": "Тест по постановлениям Пленумов ВС РФ и ВАС РФ",
+    "count": 10,          # вопросов в одной попытке
+    "minutes": 10,        # время на попытку
+    "max_attempts": 0,    # попыток на одну фамилию (0 — без ограничения)
+    "review": "full",     # full — разбор с ответами, score — только баллы
+    "cols": ["mix", "civ", "adm", "bank"],
+    "blocks": [],         # пусто — все блоки
+    "open": True,         # тест открыт для прохождения
+}
+GRACE = 3                 # секунд на доставку последнего ответа после дедлайна
+
+
+def _secret():
+    p = os.path.join(DATA, "secret.key")
+    if not os.path.exists(p):
+        with open(p, "w") as f:
+            f.write(secrets.token_hex(32))
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
+    return open(p).read().strip()
+
+
+app = Flask(__name__, static_folder=os.path.join(BASE, "static"), static_url_path="/static")
+app.config.update(
+    SECRET_KEY=_secret(),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    MAX_CONTENT_LENGTH=20 * 1024 * 1024,
+)
+app.json.ensure_ascii = False
+
+
+# ----------------------------------------------------------------- база данных
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS blocks(
+  id INTEGER PRIMARY KEY, title TEXT NOT NULL, cols TEXT NOT NULL DEFAULT '["civ","adm","bank"]');
+CREATE TABLE IF NOT EXISTS questions(
+  id TEXT PRIMARY KEY, block_id INTEGER NOT NULL, q TEXT NOT NULL, opts TEXT NOT NULL,
+  ans INTEGER NOT NULL, act TEXT NOT NULL DEFAULT '', pt TEXT NOT NULL DEFAULT '', expl TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS attempts(
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, name_key TEXT NOT NULL, col TEXT NOT NULL,
+  started INTEGER NOT NULL, deadline INTEGER NOT NULL, finished INTEGER, total INTEGER NOT NULL,
+  score INTEGER, seconds INTEGER, timeout INTEGER NOT NULL DEFAULT 0, review TEXT NOT NULL, ip TEXT);
+CREATE TABLE IF NOT EXISTS items(
+  attempt_id TEXT NOT NULL, idx INTEGER NOT NULL, qid TEXT NOT NULL, snap TEXT NOT NULL,
+  chosen INTEGER, ok INTEGER,
+  PRIMARY KEY(attempt_id, idx), FOREIGN KEY(attempt_id) REFERENCES attempts(id) ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS ix_attempts_name ON attempts(name_key);
+CREATE INDEX IF NOT EXISTS ix_items_qid ON items(qid);
+"""
+
+
+def db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH, timeout=30)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys=ON")
+    return g.db
+
+
+@app.teardown_appcontext
+def _close(_exc):
+    d = g.pop("db", None)
+    if d is not None:
+        d.close()
+
+
+def init_db():
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.executescript(SCHEMA)
+    if con.execute("SELECT COUNT(*) FROM blocks").fetchone()[0] == 0:
+        seed = os.path.join(BASE, "seed_bank.json")
+        if os.path.exists(seed):
+            with open(seed, encoding="utf-8") as f:
+                data = json.load(f)
+            for b in data["blocks"]:
+                con.execute("INSERT INTO blocks(id,title,cols) VALUES(?,?,?)",
+                            (b["id"], b["title"], json.dumps(b.get("cols") or ["civ", "adm", "bank"])))
+            for q in data["questions"]:
+                con.execute("INSERT INTO questions(id,block_id,q,opts,ans,act,pt,expl) VALUES(?,?,?,?,?,?,?,?)",
+                            (q["id"], q["b"], q["q"], json.dumps(q["o"], ensure_ascii=False), q["a"],
+                             q.get("act", ""), q.get("p", ""), q.get("e", "")))
+    env_pw = os.environ.get("TEST_ADMIN_PASSWORD")
+    if env_pw and con.execute("SELECT 1 FROM settings WHERE k='admin_hash'").fetchone() is None:
+        con.execute("INSERT INTO settings(k,v) VALUES('admin_hash',?)", (generate_password_hash(env_pw),))
+    con.commit()
+    con.close()
+
+
+def now():
+    return int(time.time())
+
+
+def jerr(msg, code=400):
+    return jsonify({"error": msg}), code
+
+
+# -------------------------------------------------------------------- настройки
+def get_settings():
+    s = dict(DEFAULTS)
+    for r in db().execute("SELECT k,v FROM settings WHERE k!='admin_hash'"):
+        try:
+            s[r["k"]] = json.loads(r["v"])
+        except ValueError:
+            pass
+    return s
+
+
+def put_settings(d):
+    out = {}
+    title = str(d.get("title", DEFAULTS["title"])).strip()[:200] or DEFAULTS["title"]
+    out["title"] = title
+    for key, lo, hi in (("count", 1, 200), ("minutes", 1, 300), ("max_attempts", 0, 100)):
+        try:
+            v = int(d.get(key, DEFAULTS[key]))
+        except (TypeError, ValueError):
+            raise ValueError("Поле «%s» должно быть числом" % key)
+        if not lo <= v <= hi:
+            raise ValueError("Поле «%s»: допустимо от %d до %d" % (key, lo, hi))
+        out[key] = v
+    if d.get("review") not in ("full", "score"):
+        raise ValueError("Режим результата: full или score")
+    out["review"] = d["review"]
+    cols = [c for c in d.get("cols", []) if c in COLS]
+    if not cols:
+        raise ValueError("Выберите хотя бы один вариант входа")
+    out["cols"] = cols
+    out["blocks"] = sorted({int(x) for x in d.get("blocks", [])})
+    out["open"] = bool(d.get("open", True))
+    con = db()
+    for k, v in out.items():
+        con.execute("INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                    (k, json.dumps(v, ensure_ascii=False)))
+    con.commit()
+    return out
+
+
+def pool_rows(col, blocks):
+    rows = db().execute(
+        "SELECT q.id,q.block_id,q.q,q.opts,q.ans,q.act,q.pt,q.expl,b.cols FROM questions q "
+        "JOIN blocks b ON b.id=q.block_id").fetchall()
+    out = []
+    for r in rows:
+        if blocks and r["block_id"] not in blocks:
+            continue
+        if col != "mix" and col not in json.loads(r["cols"]):
+            continue
+        out.append(r)
+    return out
+
+
+# --------------------------------------------------------------------- вход админа
+_fails = {}
+_fails_lock = threading.Lock()
+
+
+def admin_required(f):
+    @wraps(f)
+    def wrapper(*a, **kw):
+        if not session.get("admin"):
+            return jerr("Требуется вход администратора", 401)
+        if request.method not in ("GET", "HEAD") and request.headers.get("X-Test-Client") != "1":
+            return jerr("Недопустимый запрос", 400)
+        return f(*a, **kw)
+    return wrapper
+
+
+def admin_hash():
+    r = db().execute("SELECT v FROM settings WHERE k='admin_hash'").fetchone()
+    return r["v"] if r else None
+
+
+@app.after_request
+def _headers(resp):
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "same-origin"
+    return resp
+
+
+# ------------------------------------------------------------------- страницы
+@app.route("/")
+def page_student():
+    return send_from_directory(app.static_folder, "student.html")
+
+
+@app.route("/admin")
+def page_admin():
+    return send_from_directory(app.static_folder, "admin.html")
+
+
+# ---------------------------------------------------------------- API проходящего
+@app.get("/api/public")
+def api_public():
+    s = get_settings()
+    cols = []
+    for c in COLS:
+        if c in s["cols"]:
+            n = len(pool_rows(c, set(s["blocks"])))
+            if n:
+                cols.append({"id": c, "title": COLS[c], "n": n})
+    return jsonify({"title": s["title"], "count": s["count"], "minutes": s["minutes"],
+                    "open": s["open"], "max_attempts": s["max_attempts"], "cols": cols,
+                    "review": s["review"]})
+
+
+def _norm_name(name):
+    return re.sub(r"\s+", " ", (name or "").strip())
+
+
+def _attempt_or_404(aid):
+    a = db().execute("SELECT * FROM attempts WHERE id=?", (aid,)).fetchone()
+    return a
+
+
+def _public_items(aid):
+    rows = db().execute("SELECT idx,snap,chosen FROM items WHERE attempt_id=? ORDER BY idx", (aid,)).fetchall()
+    out = []
+    for r in rows:
+        sn = json.loads(r["snap"])
+        out.append({"idx": r["idx"], "q": sn["q"], "options": sn["shown"], "chosen": r["chosen"]})
+    return out
+
+
+@app.post("/api/start")
+def api_start():
+    d = request.get_json(silent=True) or {}
+    s = get_settings()
+    if not s["open"]:
+        return jerr("Тест сейчас закрыт администратором", 403)
+    name = _norm_name(d.get("name"))
+    if len(name) < 3 or len(name) > 80:
+        return jerr("Введите фамилию и имя (от 3 до 80 символов)")
+    col = d.get("col")
+    if col not in s["cols"] or col not in COLS:
+        return jerr("Недопустимый вариант входа")
+    key = name.casefold()
+    if s["max_attempts"]:
+        used = db().execute("SELECT COUNT(*) FROM attempts WHERE name_key=?", (key,)).fetchone()[0]
+        if used >= s["max_attempts"]:
+            return jerr("Для этой фамилии исчерпан лимит попыток (%d)" % s["max_attempts"], 403)
+    pool = pool_rows(col, set(s["blocks"]))
+    if not pool:
+        return jerr("В выбранном направлении нет вопросов", 400)
+    # случайные вопросы и порядок вариантов; правильный ответ остаётся только на сервере
+    import random
+    rnd = random.SystemRandom()
+    chosen = rnd.sample(pool, min(s["count"], len(pool)))
+    aid = secrets.token_urlsafe(18)
+    t = now()
+    con = db()
+    con.execute("INSERT INTO attempts(id,name,name_key,col,started,deadline,total,review,ip) VALUES(?,?,?,?,?,?,?,?,?)",
+                (aid, name, key, col, t, t + s["minutes"] * 60, len(chosen), s["review"], request.remote_addr))
+    for i, r in enumerate(chosen):
+        opts = json.loads(r["opts"])
+        order = list(range(4))
+        rnd.shuffle(order)
+        snap = {"q": r["q"], "shown": [opts[k] for k in order], "correct": order.index(r["ans"]),
+                "expl": r["expl"], "act": r["act"], "pt": r["pt"]}
+        con.execute("INSERT INTO items(attempt_id,idx,qid,snap) VALUES(?,?,?,?)",
+                    (aid, i, r["id"], json.dumps(snap, ensure_ascii=False)))
+    con.commit()
+    return jsonify({"attempt_id": aid, "total": len(chosen), "remaining": s["minutes"] * 60,
+                    "name": name, "questions": _public_items(aid)})
+
+
+def _finalize(a):
+    """Проверка ответов и закрытие попытки. Идемпотентна."""
+    if a["finished"]:
+        return
+    con = db()
+    t = now()
+    score = 0
+    for it in con.execute("SELECT idx,snap,chosen FROM items WHERE attempt_id=?", (a["id"],)).fetchall():
+        sn = json.loads(it["snap"])
+        ok = 1 if it["chosen"] is not None and it["chosen"] == sn["correct"] else 0
+        score += ok
+        con.execute("UPDATE items SET ok=? WHERE attempt_id=? AND idx=?", (ok, a["id"], it["idx"]))
+    timeout = 1 if t >= a["deadline"] else 0
+    seconds = max(0, min(t, a["deadline"]) - a["started"])
+    con.execute("UPDATE attempts SET finished=?,score=?,seconds=?,timeout=? WHERE id=? AND finished IS NULL",
+                (t, score, seconds, timeout, a["id"]))
+    con.commit()
+
+
+def _result(aid):
+    a = _attempt_or_404(aid)
+    out = {"finished": True, "name": a["name"], "col": a["col"], "col_title": COLS.get(a["col"], a["col"]),
+           "total": a["total"], "score": a["score"], "seconds": a["seconds"], "timeout": bool(a["timeout"]),
+           "review": a["review"]}
+    rows = db().execute("SELECT idx,snap,chosen,ok FROM items WHERE attempt_id=? ORDER BY idx", (aid,)).fetchall()
+    if a["review"] == "full":
+        out["items"] = []
+        for r in rows:
+            sn = json.loads(r["snap"])
+            out["items"].append({"idx": r["idx"], "q": sn["q"], "options": sn["shown"], "chosen": r["chosen"],
+                                 "correct": sn["correct"], "ok": bool(r["ok"]), "expl": sn["expl"],
+                                 "act": sn["act"], "pt": sn["pt"]})
+    else:
+        out["wrong"] = [r["idx"] + 1 for r in rows if not r["ok"]]
+    return out
+
+
+@app.get("/api/attempt/<aid>")
+def api_attempt(aid):
+    a = _attempt_or_404(aid)
+    if not a:
+        return jerr("Попытка не найдена", 404)
+    t = now()
+    if not a["finished"] and t > a["deadline"] + GRACE:
+        _finalize(a)
+        a = _attempt_or_404(aid)
+    if a["finished"]:
+        return jsonify(_result(aid))
+    return jsonify({"finished": False, "attempt_id": aid, "name": a["name"], "total": a["total"],
+                    "remaining": max(0, a["deadline"] - t), "questions": _public_items(aid)})
+
+
+@app.post("/api/attempt/<aid>/answer")
+def api_answer(aid):
+    a = _attempt_or_404(aid)
+    if not a:
+        return jerr("Попытка не найдена", 404)
+    if a["finished"]:
+        return jsonify({"finished": True}), 409
+    t = now()
+    if t > a["deadline"] + GRACE:
+        _finalize(a)
+        return jsonify({"finished": True}), 409
+    d = request.get_json(silent=True) or {}
+    try:
+        idx = int(d.get("idx"))
+        choice = d.get("choice")
+        choice = None if choice is None else int(choice)
+    except (TypeError, ValueError):
+        return jerr("Неверные данные")
+    if choice is not None and not 0 <= choice <= 3:
+        return jerr("Неверный вариант")
+    cur = db().execute("UPDATE items SET chosen=? WHERE attempt_id=? AND idx=?", (choice, aid, idx))
+    db().commit()
+    if cur.rowcount == 0:
+        return jerr("Вопрос не найден", 404)
+    return jsonify({"ok": True, "remaining": max(0, a["deadline"] - t)})
+
+
+@app.post("/api/attempt/<aid>/finish")
+def api_finish(aid):
+    a = _attempt_or_404(aid)
+    if not a:
+        return jerr("Попытка не найдена", 404)
+    _finalize(a)
+    return jsonify(_result(aid))
+
+
+# ------------------------------------------------------------------ API админа
+@app.get("/api/admin/me")
+def admin_me():
+    return jsonify({"configured": admin_hash() is not None, "authed": bool(session.get("admin"))})
+
+
+@app.post("/api/admin/setup")
+def admin_setup():
+    if admin_hash() is not None:
+        return jerr("Пароль уже задан", 403)
+    pw = (request.get_json(silent=True) or {}).get("password", "")
+    if len(pw) < 6:
+        return jerr("Пароль не короче 6 символов")
+    db().execute("INSERT INTO settings(k,v) VALUES('admin_hash',?)", (generate_password_hash(pw),))
+    db().commit()
+    session["admin"] = True
+    return jsonify({"ok": True})
+
+
+@app.post("/api/admin/login")
+def admin_login():
+    ip = request.remote_addr or "?"
+    with _fails_lock:
+        n, until = _fails.get(ip, (0, 0))
+        if until > time.time():
+            return jerr("Слишком много попыток. Повторите через минуту", 429)
+    h = admin_hash()
+    pw = (request.get_json(silent=True) or {}).get("password", "")
+    if h and check_password_hash(h, pw):
+        with _fails_lock:
+            _fails.pop(ip, None)
+        session["admin"] = True
+        return jsonify({"ok": True})
+    with _fails_lock:
+        n += 1
+        _fails[ip] = (n, time.time() + 60 if n >= 5 else 0)
+    return jerr("Неверный пароль", 401)
+
+
+@app.post("/api/admin/logout")
+def admin_logout():
+    session.clear()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/admin/password")
+@admin_required
+def admin_password():
+    d = request.get_json(silent=True) or {}
+    if not check_password_hash(admin_hash(), d.get("old", "")):
+        return jerr("Текущий пароль неверный", 403)
+    if len(d.get("new", "")) < 6:
+        return jerr("Новый пароль не короче 6 символов")
+    db().execute("UPDATE settings SET v=? WHERE k='admin_hash'", (generate_password_hash(d["new"]),))
+    db().commit()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/admin/settings")
+@admin_required
+def admin_get_settings():
+    return jsonify({"settings": get_settings(), "cols": COLS})
+
+
+@app.put("/api/admin/settings")
+@admin_required
+def admin_put_settings():
+    try:
+        return jsonify({"settings": put_settings(request.get_json(silent=True) or {})})
+    except ValueError as e:
+        return jerr(str(e))
+
+
+# --- блоки
+def _block_json(r, counts):
+    return {"id": r["id"], "title": r["title"], "cols": json.loads(r["cols"]), "n": counts.get(r["id"], 0)}
+
+
+@app.get("/api/admin/blocks")
+@admin_required
+def admin_blocks():
+    counts = {r[0]: r[1] for r in db().execute("SELECT block_id,COUNT(*) FROM questions GROUP BY block_id")}
+    rows = db().execute("SELECT * FROM blocks ORDER BY id").fetchall()
+    sizes = {c: len(pool_rows(c, set())) for c in COLS}
+    return jsonify({"blocks": [_block_json(r, counts) for r in rows], "totals": sizes})
+
+
+def _clean_cols(v):
+    return [c for c in (v or []) if c in ("civ", "adm", "bank")]
+
+
+@app.post("/api/admin/blocks")
+@admin_required
+def admin_block_create():
+    d = request.get_json(silent=True) or {}
+    title = (d.get("title") or "").strip()
+    if not title:
+        return jerr("Введите название блока")
+    nid = (db().execute("SELECT COALESCE(MAX(id),0) FROM blocks").fetchone()[0]) + 1
+    db().execute("INSERT INTO blocks(id,title,cols) VALUES(?,?,?)", (nid, title[:300], json.dumps(_clean_cols(d.get("cols")))))
+    db().commit()
+    return jsonify({"id": nid})
+
+
+@app.put("/api/admin/blocks/<int:bid>")
+@admin_required
+def admin_block_update(bid):
+    d = request.get_json(silent=True) or {}
+    r = db().execute("SELECT * FROM blocks WHERE id=?", (bid,)).fetchone()
+    if not r:
+        return jerr("Блок не найден", 404)
+    title = (d.get("title") if "title" in d else r["title"]).strip() or r["title"]
+    cols = _clean_cols(d["cols"]) if "cols" in d else json.loads(r["cols"])
+    db().execute("UPDATE blocks SET title=?,cols=? WHERE id=?", (title[:300], json.dumps(cols), bid))
+    db().commit()
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/admin/blocks/<int:bid>")
+@admin_required
+def admin_block_delete(bid):
+    if db().execute("SELECT 1 FROM questions WHERE block_id=? LIMIT 1", (bid,)).fetchone():
+        return jerr("В блоке есть вопросы: сначала удалите или перенесите их", 409)
+    db().execute("DELETE FROM blocks WHERE id=?", (bid,))
+    db().commit()
+    return jsonify({"ok": True})
+
+
+# --- вопросы
+def _q_json(r):
+    return {"id": r["id"], "b": r["block_id"], "q": r["q"], "o": json.loads(r["opts"]), "a": r["ans"],
+            "act": r["act"], "p": r["pt"], "e": r["expl"]}
+
+
+def _clean_question(d):
+    q = (d.get("q") or "").strip()
+    o = [(x or "").strip() for x in (d.get("o") or [])]
+    errs = []
+    if not q:
+        errs.append("введите текст вопроса")
+    if len(o) != 4 or any(not x for x in o):
+        errs.append("заполните все четыре варианта")
+    elif len(set(o)) < 4:
+        errs.append("варианты не должны повторяться")
+    try:
+        a = int(d.get("a"))
+        if not 0 <= a <= 3:
+            raise ValueError
+    except (TypeError, ValueError):
+        errs.append("отметьте правильный вариант")
+        a = 0
+    try:
+        b = int(d.get("b"))
+    except (TypeError, ValueError):
+        b = None
+    if b is None or not db().execute("SELECT 1 FROM blocks WHERE id=?", (b,)).fetchone():
+        errs.append("выберите блок")
+    return errs, {"q": q, "o": o, "a": a, "b": b, "act": (d.get("act") or "").strip(),
+                  "p": (d.get("p") or "").strip(), "e": (d.get("e") or "").strip()}
+
+
+@app.get("/api/admin/questions")
+@admin_required
+def admin_questions():
+    block = request.args.get("block", type=int)
+    text = (request.args.get("q") or "").strip().lower()
+    offset = max(0, request.args.get("offset", 0, type=int))
+    limit = min(500, max(1, request.args.get("limit", 100, type=int)))
+    rows = db().execute("SELECT * FROM questions" + (" WHERE block_id=?" if block else "") +
+                        " ORDER BY block_id, id", (block,) if block else ()).fetchall()
+    items = [_q_json(r) for r in rows]
+    if text:
+        items = [x for x in items if text in (x["q"] + " " + " ".join(x["o"]) + " " + x["act"] + " " + x["p"] + " " + x["id"]).lower()]
+    # естественная сортировка по номеру внутри блока
+    items.sort(key=lambda x: (x["b"], int(x["id"].split("-")[-1]) if x["id"].split("-")[-1].isdigit() else 0, x["id"]))
+    return jsonify({"total": len(items), "items": items[offset:offset + limit]})
+
+
+@app.get("/api/admin/questions/<qid>")
+@admin_required
+def admin_question(qid):
+    r = db().execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
+    return jsonify(_q_json(r)) if r else jerr("Вопрос не найден", 404)
+
+
+@app.post("/api/admin/questions")
+@admin_required
+def admin_question_create():
+    d = request.get_json(silent=True) or {}
+    errs, c = _clean_question(d)
+    if errs:
+        return jerr("Не сохранено: " + "; ".join(errs) + ".")
+    nums = [int(r[0].split("-")[-1]) for r in db().execute("SELECT id FROM questions WHERE block_id=?", (c["b"],))
+            if r[0].split("-")[-1].isdigit()]
+    n = (max(nums) if nums else 0) + 1
+    qid = "%d-%02d" % (c["b"], n)
+    while db().execute("SELECT 1 FROM questions WHERE id=?", (qid,)).fetchone():
+        n += 1
+        qid = "%d-%02d" % (c["b"], n)
+    db().execute("INSERT INTO questions(id,block_id,q,opts,ans,act,pt,expl) VALUES(?,?,?,?,?,?,?,?)",
+                 (qid, c["b"], c["q"], json.dumps(c["o"], ensure_ascii=False), c["a"], c["act"], c["p"], c["e"]))
+    db().commit()
+    return jsonify({"id": qid})
+
+
+@app.put("/api/admin/questions/<qid>")
+@admin_required
+def admin_question_update(qid):
+    if not db().execute("SELECT 1 FROM questions WHERE id=?", (qid,)).fetchone():
+        return jerr("Вопрос не найден", 404)
+    errs, c = _clean_question(request.get_json(silent=True) or {})
+    if errs:
+        return jerr("Не сохранено: " + "; ".join(errs) + ".")
+    db().execute("UPDATE questions SET block_id=?,q=?,opts=?,ans=?,act=?,pt=?,expl=? WHERE id=?",
+                 (c["b"], c["q"], json.dumps(c["o"], ensure_ascii=False), c["a"], c["act"], c["p"], c["e"], qid))
+    db().commit()
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/admin/questions/<qid>")
+@admin_required
+def admin_question_delete(qid):
+    db().execute("DELETE FROM questions WHERE id=?", (qid,))
+    db().commit()
+    return jsonify({"ok": True})
+
+
+# --- экспорт / импорт банка
+@app.get("/api/admin/export")
+@admin_required
+def admin_export():
+    blocks = [{"id": r["id"], "title": r["title"], "cols": json.loads(r["cols"])}
+              for r in db().execute("SELECT * FROM blocks ORDER BY id")]
+    qs = [_q_json(r) for r in db().execute("SELECT * FROM questions ORDER BY block_id,id")]
+    body = json.dumps({"version": 1, "blocks": blocks, "questions": qs}, ensure_ascii=False, indent=1)
+    return Response(body, mimetype="application/json; charset=utf-8",
+                    headers={"Content-Disposition": "attachment; filename=voprosy-plenumy.json"})
+
+
+@app.post("/api/admin/import")
+@admin_required
+def admin_import():
+    mode = request.args.get("mode", "merge")
+    d = request.get_json(silent=True) or {}
+    blocks, qs = d.get("blocks"), d.get("questions")
+    if not isinstance(blocks, list) or not isinstance(qs, list):
+        return jerr("Нужен JSON, выгруженный кнопкой «Экспорт»")
+    for q in qs:
+        if not (isinstance(q, dict) and q.get("id") and q.get("q") and isinstance(q.get("o"), list)
+                and len(q["o"]) == 4 and isinstance(q.get("a"), int) and 0 <= q["a"] <= 3 and q.get("b") is not None):
+            return jerr("Неверная запись вопроса: %s" % (q.get("id") if isinstance(q, dict) else "?"))
+    con = db()
+    if mode == "replace":
+        con.execute("DELETE FROM questions")
+        con.execute("DELETE FROM blocks")
+    added = updated = 0
+    for b in blocks:
+        title = b.get("title") or b.get("t") or ("Блок %s" % b.get("id"))
+        cols = _clean_cols(b.get("cols") if "cols" in b else b.get("col"))
+        con.execute("INSERT INTO blocks(id,title,cols) VALUES(?,?,?) ON CONFLICT(id) DO NOTHING",
+                    (int(b["id"]), title, json.dumps(cols)))
+    for q in qs:
+        if not con.execute("SELECT 1 FROM blocks WHERE id=?", (int(q["b"]),)).fetchone():
+            con.execute("INSERT INTO blocks(id,title,cols) VALUES(?,?,?)", (int(q["b"]), "Блок %s" % q["b"], "[]"))
+        exists = con.execute("SELECT 1 FROM questions WHERE id=?", (q["id"],)).fetchone() is not None
+        con.execute("INSERT INTO questions(id,block_id,q,opts,ans,act,pt,expl) VALUES(?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(id) DO UPDATE SET block_id=excluded.block_id,q=excluded.q,opts=excluded.opts,"
+                    "ans=excluded.ans,act=excluded.act,pt=excluded.pt,expl=excluded.expl",
+                    (q["id"], int(q["b"]), q["q"], json.dumps(q["o"], ensure_ascii=False), q["a"],
+                     q.get("act", ""), q.get("p", ""), q.get("e", "")))
+        updated += exists
+        added += not exists
+    con.commit()
+    return jsonify({"added": added, "updated": updated})
+
+
+# --- результаты
+def _attempt_row(r):
+    return {"id": r["id"], "name": r["name"], "col": r["col"], "col_title": COLS.get(r["col"], r["col"]),
+            "started": r["started"], "finished": r["finished"], "total": r["total"], "score": r["score"],
+            "seconds": r["seconds"], "timeout": bool(r["timeout"])}
+
+
+@app.get("/api/admin/attempts")
+@admin_required
+def admin_attempts():
+    name = (request.args.get("name") or "").strip().casefold()
+    col = request.args.get("col")
+    rows = db().execute("SELECT * FROM attempts ORDER BY started DESC").fetchall()
+    out = [_attempt_row(r) for r in rows
+           if (not name or name in r["name_key"]) and (not col or r["col"] == col)]
+    return jsonify({"total": len(out), "items": out[:1000]})
+
+
+@app.get("/api/admin/attempts/<aid>")
+@admin_required
+def admin_attempt(aid):
+    a = _attempt_or_404(aid)
+    if not a:
+        return jerr("Попытка не найдена", 404)
+    items = []
+    for r in db().execute("SELECT idx,qid,snap,chosen,ok FROM items WHERE attempt_id=? ORDER BY idx", (aid,)):
+        sn = json.loads(r["snap"])
+        items.append({"idx": r["idx"], "qid": r["qid"], "q": sn["q"], "options": sn["shown"], "chosen": r["chosen"],
+                      "correct": sn["correct"], "ok": None if r["ok"] is None else bool(r["ok"])})
+    return jsonify({"attempt": _attempt_row(a), "items": items})
+
+
+@app.delete("/api/admin/attempts/<aid>")
+@admin_required
+def admin_attempt_delete(aid):
+    db().execute("DELETE FROM attempts WHERE id=?", (aid,))
+    db().commit()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/admin/stats")
+@admin_required
+def admin_stats():
+    rows = db().execute(
+        "SELECT i.qid, COUNT(*) n, SUM(CASE WHEN i.ok=0 THEN 1 ELSE 0 END) bad FROM items i "
+        "JOIN attempts a ON a.id=i.attempt_id WHERE a.finished IS NOT NULL GROUP BY i.qid "
+        "HAVING bad>0 ORDER BY (bad*1.0/n) DESC, n DESC LIMIT 15").fetchall()
+    out = []
+    for r in rows:
+        q = db().execute("SELECT q FROM questions WHERE id=?", (r["qid"],)).fetchone()
+        out.append({"qid": r["qid"], "q": q["q"] if q else "(вопрос удалён)", "n": r["n"], "bad": r["bad"]})
+    done = db().execute("SELECT COUNT(*), AVG(score*100.0/total) FROM attempts WHERE finished IS NOT NULL").fetchone()
+    return jsonify({"hard": out, "attempts": done[0], "avg": round(done[1], 1) if done[1] is not None else None})
+
+
+@app.get("/api/admin/results.csv")
+@admin_required
+def admin_csv():
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";", quoting=csv.QUOTE_ALL)
+    w.writerow(["Участник", "Направление", "Начало", "Верно", "Всего", "Процент", "Секунд", "Время вышло", "Статус"])
+    for r in db().execute("SELECT * FROM attempts ORDER BY started DESC"):
+        done = r["finished"] is not None
+        w.writerow([r["name"], COLS.get(r["col"], r["col"]), time.strftime("%d.%m.%Y %H:%M", time.localtime(r["started"])),
+                    r["score"] if done else "", r["total"], round(r["score"] * 100 / r["total"]) if done else "",
+                    r["seconds"] if done else "", "да" if r["timeout"] else "нет", "завершён" if done else "не завершён"])
+    return Response("\ufeff" + buf.getvalue(), mimetype="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": "attachment; filename=rezultaty.csv"})
+
+
+init_db()
+
+if __name__ == "__main__":
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8080"))
+    print("Сервер теста: http://%s:%d  (администратор: /admin)" % ("localhost" if host == "0.0.0.0" else host, port))
+    try:
+        from waitress import serve
+        serve(app, host=host, port=port, threads=8)
+    except ImportError:
+        app.run(host=host, port=port, threaded=True)
