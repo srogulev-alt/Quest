@@ -169,6 +169,56 @@ class AppTests(unittest.TestCase):
         self.assertEqual(len(left), 2)
         self.assertEqual(a.delete("/api/admin/complaints/%d" % cid, headers=H).status_code, 200)
 
+    def test_analyst_role(self):
+        a = self.admin()
+        anon = self.mod.app.test_client()
+        # пароль отдела не может совпадать с паролем администратора
+        self.assertEqual(a.put("/api/admin/analyst", json={"password": "secret123"}, headers=H).status_code, 400)
+        self.assertEqual(a.put("/api/admin/analyst", json={"password": "analyst1"}, headers=H).status_code, 200)
+        self.assertEqual(anon.put("/api/admin/analyst", json={"password": "x" * 8}, headers=H).status_code, 401)
+        an = self.mod.app.test_client()
+        r = an.post("/api/admin/login", json={"password": "analyst1", "who": "Петрова А."}, headers=H).get_json()
+        self.assertEqual(r["role"], "analyst")
+        me = an.get("/api/admin/me").get_json()
+        self.assertEqual((me["role"], me["who"]), ("analyst", "Петрова А."))
+        # разрешено: вопросы (чтение и правка), блоки (чтение), замечания, журнал
+        for url in ("/api/admin/questions", "/api/admin/blocks", "/api/admin/complaints",
+                    "/api/admin/complaints.csv", "/api/admin/question_log"):
+            self.assertEqual(an.get(url).status_code, 200, url)
+        qid = an.get("/api/admin/questions?limit=1").get_json()["items"][0]["id"]
+        q = an.get("/api/admin/questions/" + qid).get_json()
+        q["e"] = q["e"] + " (уточнено)"
+        r = an.put("/api/admin/questions/" + qid, json=q, headers=H).get_json()
+        self.assertTrue(r["changed"])
+        self.assertFalse(an.put("/api/admin/questions/" + qid, json=q, headers=H).get_json()["changed"])
+        hist = an.get("/api/admin/questions/%s/history" % qid).get_json()["items"]
+        self.assertEqual((hist[0]["role"], hist[0]["who"], hist[0]["action"]), ("analyst", "Петрова А.", "update"))
+        self.assertTrue(hist[0]["after"]["e"].endswith("(уточнено)"))
+        # запрещено: всё остальное
+        forbidden = [("get", "/api/admin/settings"), ("get", "/api/admin/attempts"), ("get", "/api/admin/stats"),
+                     ("get", "/api/admin/results.csv"), ("get", "/api/admin/export"), ("get", "/api/admin/analyst"),
+                     ("post", "/api/admin/questions"), ("delete", "/api/admin/questions/" + qid),
+                     ("post", "/api/admin/import"), ("post", "/api/admin/blocks"), ("put", "/api/admin/blocks/1"),
+                     ("put", "/api/admin/settings"), ("delete", "/api/admin/complaints/1")]
+        for method, url in forbidden:
+            self.assertEqual(getattr(an, method)(url, json={}, headers=H).status_code, 403, url)
+        self.assertTrue(an.get("/api/admin/questions/" + qid).status_code == 200)   # вопрос не удалён
+        # смена собственного пароля отделом; совпадение с паролем администратора запрещено
+        self.assertEqual(an.post("/api/admin/password", json={"old": "analyst1", "new": "secret123"}, headers=H).status_code, 400)
+        self.assertEqual(an.post("/api/admin/password", json={"old": "analyst1", "new": "analyst2"}, headers=H).status_code, 200)
+        self.assertEqual(an.get("/api/admin/me").get_json()["role"], "analyst")       # свой вход сохраняется
+        # администратор меняет пароль отдела — вход отдела закрывается; админ остаётся
+        a.put("/api/admin/analyst", json={"password": "analyst3"}, headers=H)
+        self.assertEqual(an.get("/api/admin/questions").status_code, 401)
+        self.assertEqual(a.get("/api/admin/settings").status_code, 200)
+        # закрытие доступа
+        an2 = self.mod.app.test_client()
+        self.assertEqual(an2.post("/api/admin/login", json={"password": "analyst3"}, headers=H).status_code, 200)
+        a.delete("/api/admin/analyst", headers=H)
+        self.assertEqual(an2.get("/api/admin/complaints").status_code, 401)
+        self.assertEqual(self.mod.app.test_client().post("/api/admin/login", json={"password": "analyst3"}, headers=H).status_code, 401)
+        self.mod._fails.clear()
+
 
 if __name__ == "__main__":
     unittest.main()

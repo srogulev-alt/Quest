@@ -8,7 +8,7 @@
 </head>
 <body>
 <div class="wrap wide">
-  <header><h1>Администратор теста</h1><div class="small" id="who"></div></header>
+  <header><h1 id="h1">Администратор теста</h1><div class="small" id="who"></div></header>
   <nav class="tabs" id="tabs" hidden></nav>
   <main id="app"><p class="note">Загрузка…</p></main>
 </div>
@@ -45,7 +45,11 @@ async function gate(){
   catch(e){ $("app").innerHTML = `<p class="err">${esc(e.message)}. Обновите страницу.</p>`; return; }
   if (!me.configured) return setupScreen();
   if (!me.authed) return loginScreen();
-  $("tabs").hidden = false; $("who").innerHTML = `<button id="out">Выйти</button>`; NEWC = me.complaints_new || 0;
+  ROLE = me.role; NEWC = me.complaints_new || 0;
+  $("h1").textContent = ROLE === "admin" ? "Администратор теста" : "Отдел анализа: вопросы и замечания";
+  document.title = $("h1").textContent;
+  $("tabs").hidden = false;
+  $("who").innerHTML = `${esc(me.role_title)}${me.who ? " · " + esc(me.who) : ""} <button id="out">Выйти</button>`;
   $("out").onclick = async () => { await api("/api/admin/logout","POST",{}); gate(); };
   show("q");
 }
@@ -61,21 +65,32 @@ function setupScreen(){
   };
 }
 function loginScreen(){
-  $("app").innerHTML = `<div class="start"><h2>Вход для администратора</h2><div class="box">
+  $("app").innerHTML = `<div class="start"><h2>Вход для администратора и Отдела анализа</h2>
+    <p class="note">Введите свой пароль: администратора или Отдела анализа. Права определяются паролем.</p><div class="box">
     <label class="f" for="lp">Пароль</label><input type="password" id="lp" autocomplete="current-password">
+    <label class="f" for="lw">Ваше имя <span class="small">(необязательно, для журнала изменений)</span></label><input type="text" id="lw" maxlength="80" autocomplete="name">
     <div class="err" id="msg" role="alert"></div><div class="row"><button class="primary" id="ok">Войти</button></div></div></div>`;
-  const go = async () => { try { await api("/api/admin/login","POST",{password:$("lp").value}); gate(); } catch(e){ msg(e.message); $("lp").value=""; $("lp").focus(); } };
+  const go = async () => { try { await api("/api/admin/login","POST",{password:$("lp").value, who:$("lw").value}); gate(); } catch(e){ msg(e.message); $("lp").value=""; $("lp").focus(); } };
+  $("lw").value = (() => { try { return localStorage.getItem("plenum-staff-name") || ""; } catch(e){ return ""; } })();
+  $("lw").onchange = () => { try { localStorage.setItem("plenum-staff-name", $("lw").value.trim()); } catch(e){} };
+  $("lw").onkeydown = e => { if (e.key === "Enter") go(); };
   $("ok").onclick = go; $("lp").onkeydown = e => { if (e.key === "Enter") go(); }; $("lp").focus();
 }
 
 /* ---------- вкладки ---------- */
-const TABS = [["q","Вопросы"],["b","Коллегии и блоки"],["s","Настройки"],["r","Результаты"],["c","Замечания"]];
+// вкладки по ролям: Отделу анализа доступны только вопросы (правка) и замечания участников
+const TABS = {
+  admin:   [["q","Вопросы"],["b","Коллегии и блоки"],["s","Настройки"],["r","Результаты"],["c","Замечания"],["l","Журнал изменений"]],
+  analyst: [["q","Вопросы"],["c","Замечания"],["l","Журнал изменений"],["p","Пароль"]],
+};
 let NEWC = 0;   // новых замечаний участников (число на вкладке)
+let ROLE = null;
+const isAdmin = () => ROLE === "admin";
 function show(t){
-  $("tabs").innerHTML = TABS.map(([k,n]) => `<button data-t="${k}" class="${k===t?"on":""}">${n}${k==="c"&&NEWC?` <span class="badge" id="newc">${NEWC}</span>`:""}</button>`).join("") +
+  $("tabs").innerHTML = TABS[ROLE].map(([k,n]) => `<button data-t="${k}" class="${k===t?"on":""}">${n}${k==="c"&&NEWC?` <span class="badge" id="newc">${NEWC}</span>`:""}</button>`).join("") +
     `<a class="right" href="/" target="_blank" rel="noopener"><button>Открыть тест ↗</button></a>`;
   document.querySelectorAll("#tabs [data-t]").forEach(b => b.onclick = () => show(b.dataset.t));
-  ({q:qList,b:blocksScreen,s:settingsScreen,r:resultsScreen,c:complaintsScreen})[t]()
+  ({q:qList,b:blocksScreen,s:settingsScreen,r:resultsScreen,c:complaintsScreen,l:logScreen,p:pwScreen})[t]()
     .catch(e => { if (e.message !== "Требуется вход") $("app").innerHTML = `<p class="err">${esc(e.message)}</p>`; });
 }
 
@@ -87,10 +102,11 @@ async function qList(){
   const p = new URLSearchParams({limit:100, offset:QF.offset}); if (QF.block) p.set("block", QF.block); if (QF.q) p.set("q", QF.q);
   const r = await api("/api/admin/questions?" + p);
   $("app").innerHTML = `<h2>Вопросы</h2>
-    <div class="ed-top"><button class="primary" id="add">Добавить вопрос</button>
+    ${isAdmin() ? `<div class="ed-top"><button class="primary" id="add">Добавить вопрос</button>
       <a href="/api/admin/export"><button>Экспорт JSON</button></a>
       <button id="imp">Импорт (объединить)</button><button id="impAll">Импорт (заменить всё)</button>
-      <input type="file" id="file" accept=".json,application/json" hidden></div>
+      <input type="file" id="file" accept=".json,application/json" hidden></div>`
+      : `<p class="note">Можно править формулировки, варианты, правильный ответ, ссылку на постановление и пояснение. Добавлять и удалять вопросы может администратор. Все правки попадают в журнал изменений.</p>`}
     <div class="ed-top"><input type="search" id="srch" placeholder="Поиск по тексту, акту, номеру" value="${esc(QF.q)}">
       <select id="blk"><option value="0">Все блоки</option>${BLOCKS.map(b=>`<option value="${b.id}">${b.id}. ${esc(b.title)} (${b.n})</option>`).join("")}</select></div>
     <p class="note">Найдено: ${r.total}${r.total>QF.offset+100?`. Показано ${QF.offset+1}–${QF.offset+100}`:""}</p>
@@ -100,10 +116,11 @@ async function qList(){
   $("blk").value = String(QF.block);
   let t; $("srch").oninput = e => { clearTimeout(t); t = setTimeout(() => { QF.q = e.target.value; QF.offset = 0; qList().then(()=>{ const s=$("srch"); s.focus(); s.setSelectionRange(s.value.length,s.value.length); }); }, 300); };
   $("blk").onchange = e => { QF.block = +e.target.value; QF.offset = 0; qList(); };
-  $("add").onclick = () => qForm(null);
   document.querySelectorAll("[data-e]").forEach(b => b.onclick = () => qForm(b.dataset.e));
   if ($("pv")) $("pv").onclick = () => { QF.offset -= 100; qList(); };
   if ($("nx")) $("nx").onclick = () => { QF.offset += 100; qList(); };
+  if (!isAdmin()) return;
+  $("add").onclick = () => qForm(null);
   let mode = "merge";
   $("imp").onclick = () => { mode = "merge"; $("file").click(); };
   $("impAll").onclick = () => { if (confirm("Все текущие вопросы будут заменены содержимым файла. Результаты не изменятся. Продолжить?")){ mode = "replace"; $("file").click(); } };
@@ -127,14 +144,21 @@ async function qForm(id, back){
     <label class="f" for="fp">Пункт</label><input type="text" id="fp" value="${esc(q.p)}">
     <label class="f" for="fe">Пояснение к ответу</label><textarea id="fe" rows="4">${esc(q.e)}</textarea>
     <div class="err" id="msg" role="alert"></div>
-    <div class="row"><button class="primary" id="save">Сохранить вопрос</button><button id="cancel">Отмена</button>${id?`<button class="danger" id="del">Удалить</button>`:""}</div></div>`;
+    <div class="row"><button class="primary" id="save">Сохранить вопрос</button><button id="cancel">Отмена</button>${id&&isAdmin()?`<button class="danger" id="del">Удалить</button>`:""}</div></div>
+    ${id ? `<h3>История изменений</h3><div id="hist"><p class="note">Загрузка…</p></div>` : ""}`;
+  if (id) api("/api/admin/questions/" + encodeURIComponent(id) + "/history")
+    .then(h => { $("hist").innerHTML = h.items.length ? h.items.map(x => logEntry(x, false)).join("") : `<p class="note">Изменений через панель пока не было.</p>`; })
+    .catch(e => { $("hist").innerHTML = `<p class="err">${esc(e.message)}</p>`; });
   $("fb").value = String(q.b);
   document.querySelectorAll("input[name=corr]").forEach(r => r.onchange = () => { for (let i=0;i<4;i++) $("or"+i).classList.toggle("correct", +r.value===i && r.checked); });
   $("cancel").onclick = () => back();
   if ($("del")) $("del").onclick = async () => { if (confirm("Удалить вопрос " + q.id + "?")){ await api("/api/admin/questions/"+encodeURIComponent(id),"DELETE"); back(); } };
   $("save").onclick = async () => {
     const body = {b:+$("fb").value, q:$("fq").value, o:[0,1,2,3].map(i=>$("fo"+i).value), a:+document.querySelector("input[name=corr]:checked").value, act:$("fact").value, p:$("fp").value, e:$("fe").value};
-    try { if (id) await api("/api/admin/questions/"+encodeURIComponent(id),"PUT",body); else await api("/api/admin/questions","POST",body); back(); }
+    try {
+      if (id){ const r = await api("/api/admin/questions/"+encodeURIComponent(id),"PUT",body); if (r && r.changed === false){ msg("Изменений нет: сохранять нечего.", true); return; } }
+      else await api("/api/admin/questions","POST",body);
+      back(); }
     catch(e){ msg(e.message); }
   };
 }
@@ -178,19 +202,75 @@ async function settingsScreen(){
     <label class="f">Блоки вопросов (ничего не отмечено — все)</label>
     ${BLOCKS.map(b=>`<div class="chk"><input type="checkbox" class="s-b" id="sb-${b.id}" value="${b.id}" ${s.blocks.includes(b.id)?"checked":""}><label for="sb-${b.id}">${b.id}. ${esc(b.title)} (${b.n})</label></div>`).join("")}
     <div id="msg" role="alert"></div><div class="row"><button class="primary" id="save">Сохранить настройки</button></div></div>
-    <h3>Смена пароля</h3><div class="box" style="max-width:420px"><label class="f" for="o">Текущий пароль</label><input type="password" id="o">
-    <label class="f" for="n">Новый пароль (не короче 6 символов)</label><input type="password" id="n"><div id="msg2" role="alert"></div>
-    <div class="row"><button id="chg">Сменить пароль</button></div></div>`;
+    <h3>Доступ Отдела анализа</h3><div class="box" style="max-width:520px" id="an"><p class="note">Загрузка…</p></div>
+    <h3>Смена пароля администратора</h3>${pwBoxHtml()}`;
+  pwBoxInit(); analystBox();
   $("s-v").value = s.review;
   $("save").onclick = async () => {
     const body = {open:$("s-open").checked, title:$("s-t").value, count:$("s-c").value, minutes:$("s-m").value, max_attempts:$("s-a").value, review:$("s-v").value,
       cols:[...document.querySelectorAll(".s-cl:checked")].map(x=>x.value), blocks:[...document.querySelectorAll(".s-b:checked")].map(x=>+x.value)};
     try { await api("/api/admin/settings","PUT",body); msg("Настройки сохранены. Они действуют для новых попыток.", true); } catch(e){ msg(e.message); }
   };
+}
+async function analystBox(){
+  const r = await api("/api/admin/analyst");
+  $("an").innerHTML = `<p>${r.enabled ? "Доступ <b>открыт</b>." : "Доступ <b>закрыт</b>: пароль не задан."}</p>
+    <p class="note">Отдел анализа входит на эту же страницу своим паролем и может только править вопросы и работать с замечаниями участников. Настройки, результаты участников, блоки, импорт и удаление ему недоступны. При смене пароля все входы отдела закрываются.</p>
+    <label class="f" for="anp">${r.enabled ? "Новый пароль Отдела анализа" : "Пароль Отдела анализа"} (не короче 6 символов)</label><input type="password" id="anp" autocomplete="new-password">
+    <div id="anmsg" role="alert"></div>
+    <div class="row"><button class="primary" id="anset">${r.enabled ? "Сменить пароль" : "Открыть доступ"}</button>${r.enabled ? `<button class="danger" id="anoff">Закрыть доступ</button>` : ""}</div>`;
+  const m = (t, ok) => { $("anmsg").className = ok ? "note" : "err"; $("anmsg").textContent = t; };
+  $("anset").onclick = async () => { try { await api("/api/admin/analyst","PUT",{password:$("anp").value}); await analystBox(); m("Пароль Отдела анализа сохранён. Передайте его сотрудникам отдела.", true); } catch(e){ m(e.message); } };
+  if ($("anoff")) $("anoff").onclick = async () => { if (confirm("Закрыть доступ Отдела анализа? Все входы отдела перестанут действовать.")){ await api("/api/admin/analyst","DELETE"); await analystBox(); m("Доступ закрыт.", true); } };
+}
+function pwBoxHtml(){
+  return `<div class="box" style="max-width:420px"><label class="f" for="o">Текущий пароль</label><input type="password" id="o" autocomplete="current-password">
+    <label class="f" for="n">Новый пароль (не короче 6 символов)</label><input type="password" id="n" autocomplete="new-password"><div id="msg2" role="alert"></div>
+    <div class="row"><button id="chg">Сменить пароль</button></div></div>`;
+}
+function pwBoxInit(){
   $("chg").onclick = async () => { const m = $("msg2");
-    try { await api("/api/admin/password","POST",{old:$("o").value,new:$("n").value}); m.className="note"; m.textContent="Пароль изменён."; $("o").value=$("n").value=""; }
+    try { await api("/api/admin/password","POST",{old:$("o").value,new:$("n").value}); m.className="note"; m.textContent="Пароль изменён. Другие открытые входы с прежним паролем закрыты."; $("o").value=$("n").value=""; }
     catch(e){ m.className="err"; m.textContent=e.message; } };
 }
+async function pwScreen(){
+  $("app").innerHTML = `<h2>Смена пароля Отдела анализа</h2><p class="note">Пароль общий для отдела: после смены сообщите его коллегам, их открытые входы закроются. Если пароль забыт, его может задать администратор.</p>${pwBoxHtml()}`;
+  pwBoxInit();
+}
+
+/* ---------- журнал изменений вопросов ---------- */
+const FIELDS = [["b","Блок"],["q","Текст вопроса"],["o","Варианты"],["a","Правильный ответ"],["act","Постановление"],["p","Пункт"],["e","Пояснение"]];
+const ACTIONS = {update:"изменён", create:"добавлен", delete:"удалён"};
+function fieldText(k, v){
+  if (v == null) return "";
+  if (k === "o") return v.map((x,i) => LET[i] + ") " + x).join("\n");
+  if (k === "a") return LET[v];
+  return String(v);
+}
+function logEntry(x, withOpen = true){
+  const by = esc(x.role_title) + (x.who ? " · " + esc(x.who) : "");
+  let body = "";
+  if (x.action === "update"){
+    const ch = FIELDS.filter(([k]) => JSON.stringify(x.before[k]) !== JSON.stringify(x.after[k]));
+    body = ch.map(([k,n]) => `<div class="diff"><b>${n}</b><div class="was">${esc(fieldText(k, x.before[k]))}</div><div class="now">${esc(fieldText(k, x.after[k]))}</div></div>`).join("");
+  } else {
+    const q = x.after || x.before;
+    body = `<div class="diff"><div class="${x.after?"now":"was"}">${esc(q.q)}</div></div>`;
+  }
+  return `<details class="logitem"><summary>${fmtT(x.at)} · вопрос <b>${esc(x.qid)}</b> ${ACTIONS[x.action] || x.action} · ${by}</summary>${body}
+    ${withOpen && x.action !== "delete" ? `<div class="row" style="margin:8px 0 0"><button data-lq="${esc(x.qid)}">Открыть вопрос</button></div>` : ""}</details>`;
+}
+let LF = "";
+async function logScreen(){
+  const r = await api("/api/admin/question_log" + (LF ? "?role=" + LF : ""));
+  $("app").innerHTML = `<h2>Журнал изменений вопросов</h2>
+    <p class="note">Правки, сделанные через панель (последние 300). Нажмите на запись, чтобы увидеть, что было и что стало. Импорт банка из файла в журнал не записывается.</p>
+    <div class="ed-top"><select id="lf"><option value="">Все</option><option value="analyst">Отдел анализа</option><option value="admin">Администратор</option></select></div>
+    ${r.items.length ? r.items.map(x => logEntry(x)).join("") : `<p class="note">Записей нет.</p>`}`;
+  $("lf").value = LF; $("lf").onchange = e => { LF = e.target.value; logScreen(); };
+  bindLogButtons(logScreen);
+}
+function bindLogButtons(back){ document.querySelectorAll("[data-lq]").forEach(b => b.onclick = () => qForm(b.dataset.lq, back)); }
 
 /* ---------- результаты ---------- */
 let RF = {name:"", col:""};
@@ -245,7 +325,8 @@ async function complaintsScreen(){
       <p class="ref">${esc(s.act)}${s.pt ? ", " + esc(s.pt) : ""}</p>
       <div class="row" style="margin:8px 0 0">${c.q_state!=="deleted" ? `<button data-qe="${esc(c.qid)}">Открыть вопрос</button>` : ""}
         <button data-cs="${c.id}" data-to="${c.status==="new"?"resolved":"new"}">${c.status==="new"?"Отметить рассмотренным":"Вернуть в новые"}</button>
-        <button class="danger" data-cd="${c.id}">Удалить</button></div></div>`; }).join("")
+        ${isAdmin() ? `<button class="danger" data-cd="${c.id}">Удалить</button>` : ""}</div>
+      ${c.status==="resolved" && c.handled_by ? `<p class="small" style="margin:6px 0 0">Рассмотрено: ${esc(c.handled_by)}, ${fmtT(c.handled_at)}</p>` : ""}</div>`; }).join("")
       : `<p class="note">${CF==="new" ? "Новых замечаний нет." : "Замечаний нет."}</p>`}`;
   $("cf").value = CF;
   $("cf").onchange = e => { CF = e.target.value; complaintsScreen(); };
