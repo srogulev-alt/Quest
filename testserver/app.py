@@ -806,7 +806,12 @@ def admin_import():
         if mode == "replace":
             con.execute("DELETE FROM questions")
             con.execute("DELETE FROM blocks")
-        con.executemany("INSERT INTO blocks(id,title,cols) VALUES(?,?,?) ON CONFLICT(id) DO NOTHING", blocks)
+        if request.args.get("blocks") == "update":
+            # обновить названия и направления уже существующих блоков (по умолчанию они сохраняются)
+            con.executemany("INSERT INTO blocks(id,title,cols) VALUES(?,?,?) "
+                            "ON CONFLICT(id) DO UPDATE SET title=excluded.title,cols=excluded.cols", blocks)
+        else:
+            con.executemany("INSERT INTO blocks(id,title,cols) VALUES(?,?,?) ON CONFLICT(id) DO NOTHING", blocks)
         for row in qs:
             con.execute("INSERT INTO blocks(id,title,cols) VALUES(?,?,'[]') ON CONFLICT(id) DO NOTHING",
                         (row[1], "Блок %d" % row[1]))
