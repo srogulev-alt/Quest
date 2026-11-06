@@ -169,56 +169,80 @@ class AppTests(unittest.TestCase):
         self.assertEqual(len(left), 2)
         self.assertEqual(a.delete("/api/admin/complaints/%d" % cid, headers=H).status_code, 200)
 
-    def test_analyst_role(self):
-        a = self.admin()
-        anon = self.mod.app.test_client()
-        # пароль отдела не может совпадать с паролем администратора
-        self.assertEqual(a.put("/api/admin/analyst", json={"password": "secret123"}, headers=H).status_code, 400)
-        self.assertEqual(a.put("/api/admin/analyst", json={"password": "analyst1"}, headers=H).status_code, 200)
-        self.assertEqual(anon.put("/api/admin/analyst", json={"password": "x" * 8}, headers=H).status_code, 401)
-        an = self.mod.app.test_client()
-        r = an.post("/api/admin/login", json={"password": "analyst1", "who": "Петрова А."}, headers=H).get_json()
-        self.assertEqual(r["role"], "analyst")
-        me = an.get("/api/admin/me").get_json()
-        self.assertEqual((me["role"], me["who"]), ("analyst", "Петрова А."))
-        # разрешено: вопросы (чтение и правка), блоки (чтение), замечания, журнал
-        for url in ("/api/admin/questions", "/api/admin/blocks", "/api/admin/complaints",
-                    "/api/admin/complaints.csv", "/api/admin/question_log"):
-            self.assertEqual(an.get(url).status_code, 200, url)
-        qid = an.get("/api/admin/questions?limit=1").get_json()["items"][0]["id"]
-        q = an.get("/api/admin/questions/" + qid).get_json()
-        q["e"] = q["e"] + " (уточнено)"
-        r = an.put("/api/admin/questions/" + qid, json=q, headers=H).get_json()
-        self.assertTrue(r["changed"])
-        self.assertFalse(an.put("/api/admin/questions/" + qid, json=q, headers=H).get_json()["changed"])
-        hist = an.get("/api/admin/questions/%s/history" % qid).get_json()["items"]
-        self.assertEqual((hist[0]["role"], hist[0]["who"], hist[0]["action"]), ("analyst", "Петрова А.", "update"))
-        self.assertTrue(hist[0]["after"]["e"].endswith("(уточнено)"))
-        # запрещено: всё остальное
-        forbidden = [("get", "/api/admin/settings"), ("get", "/api/admin/attempts"), ("get", "/api/admin/stats"),
-                     ("get", "/api/admin/results.csv"), ("get", "/api/admin/export"), ("get", "/api/admin/analyst"),
-                     ("post", "/api/admin/questions"), ("delete", "/api/admin/questions/" + qid),
-                     ("post", "/api/admin/import"), ("post", "/api/admin/blocks"), ("put", "/api/admin/blocks/1"),
-                     ("put", "/api/admin/settings"), ("delete", "/api/admin/complaints/1")]
-        for method, url in forbidden:
-            self.assertEqual(getattr(an, method)(url, json={}, headers=H).status_code, 403, url)
-        self.assertTrue(an.get("/api/admin/questions/" + qid).status_code == 200)   # вопрос не удалён
-        # смена собственного пароля отделом; совпадение с паролем администратора запрещено
-        self.assertEqual(an.post("/api/admin/password", json={"old": "analyst1", "new": "secret123"}, headers=H).status_code, 400)
-        self.assertEqual(an.post("/api/admin/password", json={"old": "analyst1", "new": "analyst2"}, headers=H).status_code, 200)
-        self.assertEqual(an.get("/api/admin/me").get_json()["role"], "analyst")       # свой вход сохраняется
-        # администратор меняет пароль отдела — вход отдела закрывается; админ остаётся
-        a.put("/api/admin/analyst", json={"password": "analyst3"}, headers=H)
-        self.assertEqual(an.get("/api/admin/questions").status_code, 401)
-        self.assertEqual(a.get("/api/admin/settings").status_code, 200)
-        # закрытие доступа
-        an2 = self.mod.app.test_client()
-        self.assertEqual(an2.post("/api/admin/login", json={"password": "analyst3"}, headers=H).status_code, 200)
-        a.delete("/api/admin/analyst", headers=H)
-        self.assertEqual(an2.get("/api/admin/complaints").status_code, 401)
-        self.assertEqual(self.mod.app.test_client().post("/api/admin/login", json={"password": "analyst3"}, headers=H).status_code, 401)
-        self.mod._fails.clear()
+    def login_user(self, login, pw):
+        c = self.mod.app.test_client()
+        r = c.post("/api/admin/login", json={"login": login, "password": pw}, headers=H)
+        return c, r
 
+    def test_users_and_permissions(self):
+        a = self.admin()
+        P = self.mod.PERMS
+        # создание: проверки логина и пароля, повтор логина
+        self.assertEqual(a.post("/api/admin/users", json={"login": "admin", "password": "x" * 8}, headers=H).status_code, 400)
+        self.assertEqual(a.post("/api/admin/users", json={"login": "a b", "password": "x" * 8}, headers=H).status_code, 400)
+        self.assertEqual(a.post("/api/admin/users", json={"login": "petrova", "password": "123"}, headers=H).status_code, 400)
+        r = a.post("/api/admin/users", json={"login": "Petrova", "name": "Петрова А.", "password": "pass-petrova",
+                                             "perms": ["questions_edit", "complaints", "nonsense"]}, headers=H)
+        self.assertEqual(r.status_code, 200)
+        uid = r.get_json()["id"]
+        self.assertEqual(a.post("/api/admin/users", json={"login": "petrova", "password": "x" * 8}, headers=H).status_code, 409)
+        users = {u["login"]: u for u in a.get("/api/admin/users").get_json()["items"]}
+        self.assertEqual(users["petrova"]["perms"], ["questions_edit", "complaints"])      # логин без учёта регистра, лишнее право отброшено
+        # не-администратор не управляет пользователями
+        self.assertEqual(self.client.get("/api/admin/users").status_code, 401)
+        # вход пользователя
+        _, bad = self.login_user("petrova", "wrong-pass")
+        self.assertEqual(bad.status_code, 401)
+        u, r = self.login_user("PETROVA", "pass-petrova")
+        self.assertEqual(r.get_json()["role"], "user")
+        me = u.get_json() if False else u.get("/api/admin/me").get_json()
+        self.assertEqual((me["role"], me["login"], me["perms"]), ("user", "petrova", ["questions_edit", "complaints"]))
+        self.assertEqual(u.get("/api/admin/users").status_code, 403)
+        self.assertEqual(u.post("/api/admin/users", json={"login": "evil", "password": "x" * 8, "perms": list(P)}, headers=H).status_code, 403)
+        # что разрешено с правами «правка вопросов» + «замечания»
+        for url in ("/api/admin/questions", "/api/admin/blocks", "/api/admin/complaints", "/api/admin/complaints.csv",
+                    "/api/admin/question_log"):
+            self.assertEqual(u.get(url).status_code, 200, url)
+        qid = u.get("/api/admin/questions?limit=1").get_json()["items"][0]["id"]
+        q = u.get("/api/admin/questions/" + qid).get_json()
+        q["e"] += " (уточнено)"
+        self.assertTrue(u.put("/api/admin/questions/" + qid, json=q, headers=H).get_json()["changed"])
+        hist = u.get("/api/admin/questions/%s/history" % qid).get_json()["items"]
+        self.assertEqual((hist[0]["role"], hist[0]["by"]), ("user", "Петрова А. (petrova)"))
+        self.assertIn("Петрова А. (petrova)", u.get("/api/admin/question_log").get_json()["people"])
+        self.assertEqual(len(u.get("/api/admin/question_log?by=" + "Петрова А. (petrova)").get_json()["items"]), 1)
+        # что запрещено
+        forbidden = [("get", "/api/admin/settings"), ("get", "/api/admin/attempts"), ("get", "/api/admin/stats"),
+                     ("get", "/api/admin/results.csv"), ("get", "/api/admin/export"), ("post", "/api/admin/questions"),
+                     ("delete", "/api/admin/questions/" + qid), ("post", "/api/admin/import"), ("post", "/api/admin/blocks"),
+                     ("put", "/api/admin/blocks/1"), ("put", "/api/admin/settings")]
+        for method, url in forbidden:
+            self.assertEqual(getattr(u, method)(url, json={}, headers=H).status_code, 403, url)
+        # права меняются сразу, без повторного входа
+        a.put("/api/admin/users/%d" % uid, json={"perms": ["results"]}, headers=H)
+        self.assertEqual(u.get("/api/admin/questions").status_code, 403)
+        self.assertEqual(u.get("/api/admin/attempts").status_code, 200)
+        a.put("/api/admin/users/%d" % uid, json={"perms": []}, headers=H)
+        self.assertEqual(u.get("/api/admin/me").get_json()["perms"], [])
+        # смена собственного пароля; сброс администратором закрывает входы
+        self.assertEqual(u.post("/api/admin/password", json={"old": "pass-petrova", "new": "new-pass-1"}, headers=H).status_code, 200)
+        self.assertTrue(u.get("/api/admin/me").get_json()["authed"])
+        a.put("/api/admin/users/%d" % uid, json={"password": "by-admin-1"}, headers=H)
+        self.assertFalse(u.get("/api/admin/me").get_json()["authed"])
+        u, r = self.login_user("petrova", "by-admin-1")
+        self.assertEqual(r.status_code, 200)
+        # запрет входа и удаление
+        a.put("/api/admin/users/%d" % uid, json={"active": False}, headers=H)
+        self.assertFalse(u.get("/api/admin/me").get_json()["authed"])
+        self.assertEqual(self.login_user("petrova", "by-admin-1")[1].status_code, 401)
+        a.put("/api/admin/users/%d" % uid, json={"active": True}, headers=H)
+        u, _ = self.login_user("petrova", "by-admin-1")
+        a.delete("/api/admin/users/%d" % uid, headers=H)
+        self.assertFalse(u.get("/api/admin/me").get_json()["authed"])
+        self.assertEqual(self.login_user("petrova", "by-admin-1")[1].status_code, 401)
+        # правки удалённого пользователя остаются в журнале
+        self.assertEqual(a.get("/api/admin/questions/%s/history" % qid).get_json()["items"][0]["by"], "Петрова А. (petrova)")
+        self.mod._fails.clear()
 
 if __name__ == "__main__":
     unittest.main()

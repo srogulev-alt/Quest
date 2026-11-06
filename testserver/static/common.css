@@ -117,3 +117,8 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 .diff .was,.diff .now{white-space:pre-wrap;padding:6px 10px;border-radius:6px;margin-top:4px;font-size:.92rem}
 .diff .was{background:var(--badbg);text-decoration:line-through;text-decoration-color:var(--bad)}
 .diff .now{background:var(--okbg)}
+
+/* пользователи */
+table.users th{font-size:.82rem;vertical-align:bottom}
+table.users td input[type=checkbox]{width:18px;height:18px}
+table.users tr.off td{opacity:.55}

@@ -1,33 +1,37 @@
 # -*- coding: utf-8 -*-
 """Сброс пароля:
-  python reset_admin.py НОВЫЙ_ПАРОЛЬ              — пароль администратора
-  python reset_admin.py --analyst НОВЫЙ_ПАРОЛЬ    — пароль Отдела анализа
-  python reset_admin.py --analyst --off           — закрыть доступ Отдела анализа
-После сброса все открытые входы этой роли перестают действовать."""
+  python reset_admin.py НОВЫЙ_ПАРОЛЬ                 — пароль администратора
+  python reset_admin.py --user ЛОГИН НОВЫЙ_ПАРОЛЬ    — пароль пользователя (пользователь также включается)
+После сброса все открытые входы с прежним паролем перестают действовать.
+Пользователей и их права задаёт администратор в панели: вкладка «Пользователи»."""
 import os, sqlite3, sys
-from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.security import generate_password_hash
 
 USAGE = __doc__.split("\n", 1)[1]
 args = sys.argv[1:]
-role = "admin"
-if args[:1] == ["--analyst"]:
-    role, args = "analyst", args[1:]
-off = role == "analyst" and args == ["--off"]
-if not off and (len(args) != 1 or len(args[0]) < 6):
+login = None
+if args[:1] == ["--user"]:
+    if len(args) != 3:
+        sys.exit("Использование:\n" + USAGE)
+    login, args = args[1].strip().casefold(), args[2:]
+if len(args) != 1 or len(args[0]) < 6:
     sys.exit("Использование (пароль не короче 6 символов):\n" + USAGE)
 base = os.path.dirname(os.path.abspath(__file__))
 db = os.path.join(os.environ.get("TEST_DATA_DIR", os.path.join(base, "data")), "test.db")
 if not os.path.exists(db):
     sys.exit("База данных не найдена: " + db + ". Сначала запустите сервер.")
 con = sqlite3.connect(db)
-if off:
-    con.execute("DELETE FROM settings WHERE k='analyst_hash'")
-    con.commit()
-    sys.exit(print("Доступ Отдела анализа закрыт.") or 0)
-other = con.execute("SELECT v FROM settings WHERE k=?", ("analyst_hash" if role == "admin" else "admin_hash",)).fetchone()
-if other and check_password_hash(other[0], args[0]):
-    sys.exit("Пароли администратора и Отдела анализа не должны совпадать.")
-con.execute("INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-            (role + "_hash", generate_password_hash(args[0])))
+h = generate_password_hash(args[0])
+if login is None:
+    con.execute("INSERT INTO settings(k,v) VALUES('admin_hash',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (h,))
+    msg = "Пароль администратора изменён."
+else:
+    try:
+        cur = con.execute("UPDATE users SET hash=?, active=1 WHERE login=?", (h, login))
+    except sqlite3.OperationalError:
+        sys.exit("В базе нет таблицы пользователей: сначала запустите сервер новой версии.")
+    if cur.rowcount == 0:
+        sys.exit("Пользователь «%s» не найден." % login)
+    msg = "Пароль пользователя «%s» изменён." % login
 con.commit()
-print("Пароль администратора изменён." if role == "admin" else "Пароль Отдела анализа задан.")
+print(msg)

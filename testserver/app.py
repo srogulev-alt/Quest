@@ -114,6 +114,9 @@ CREATE TABLE IF NOT EXISTS question_log(
   id INTEGER PRIMARY KEY, qid TEXT NOT NULL, at INTEGER NOT NULL, role TEXT NOT NULL, who TEXT NOT NULL DEFAULT '',
   action TEXT NOT NULL, before TEXT, after TEXT);
 CREATE INDEX IF NOT EXISTS ix_question_log_qid ON question_log(qid, at);
+CREATE TABLE IF NOT EXISTS users(
+  id INTEGER PRIMARY KEY, login TEXT NOT NULL UNIQUE, name TEXT NOT NULL DEFAULT '', hash TEXT NOT NULL,
+  perms TEXT NOT NULL DEFAULT '[]', active INTEGER NOT NULL DEFAULT 1, created INTEGER NOT NULL, last_login INTEGER);
 """
 # Замечания намеренно не связаны внешним ключом с attempts: в snap хранится копия
 # вопроса в том виде, в каком его видел участник, и замечание переживает удаление попытки.
@@ -175,9 +178,12 @@ def init_db():
                             (q["id"], q["b"], q["q"], json.dumps(q["o"], ensure_ascii=False), q["a"],
                              q.get("act", ""), q.get("p", ""), q.get("e", "")))
     con.execute("INSERT OR IGNORE INTO settings(k,v) VALUES('seeded','true')")
-    an_pw = os.environ.get("TEST_ANALYST_PASSWORD")
-    if an_pw and con.execute("SELECT 1 FROM settings WHERE k='analyst_hash'").fetchone() is None:
-        con.execute("INSERT INTO settings(k,v) VALUES('analyst_hash',?)", (generate_password_hash(an_pw),))
+    # прежний общий пароль «Отдела анализа» становится обычным пользователем с теми же правами
+    old = con.execute("SELECT v FROM settings WHERE k='analyst_hash'").fetchone()
+    if old:
+        con.execute("INSERT OR IGNORE INTO users(login,name,hash,perms,created) VALUES(?,?,?,?,?)",
+                    ("otdel-analiza", "Отдел анализа", old[0], json.dumps(["questions_edit", "complaints"]), int(time.time())))
+        con.execute("DELETE FROM settings WHERE k='analyst_hash'")
     env_pw = os.environ.get("TEST_ADMIN_PASSWORD")
     if env_pw and con.execute("SELECT 1 FROM settings WHERE k='admin_hash'").fetchone() is None:
         con.execute("INSERT INTO settings(k,v) VALUES('admin_hash',?)", (generate_password_hash(env_pw),))
@@ -296,16 +302,23 @@ _fails = {}
 _fails_lock = threading.Lock()
 
 
-ROLES = {"admin": "Администратор", "analyst": "Отдел анализа"}
-
-
-def _hash(role):
-    r = db().execute("SELECT v FROM settings WHERE k=?", (role + "_hash",)).fetchone()
-    return r["v"] if r else None
+# Права пользователей (администратор имеет все права и, кроме того, управляет пользователями)
+PERMS = {
+    "questions_edit": "Правка вопросов",
+    "questions_manage": "Добавление и удаление вопросов, импорт и экспорт банка",
+    "blocks": "Коллегии и блоки",
+    "complaints": "Замечания участников",
+    "results": "Результаты участников",
+    "settings": "Настройки теста",
+}
+Q_ANY = ("questions_edit", "questions_manage")   # любое право на вопросы даёт просмотр и журнал изменений
+ROLE_TITLES = {"admin": "Администратор", "user": "Пользователь", "analyst": "Отдел анализа"}  # analyst — записи прежних версий
+LOGIN_RE = re.compile(r"^[\w.-]{3,40}$")
 
 
 def admin_hash():
-    return _hash("admin")
+    r = db().execute("SELECT v FROM settings WHERE k='admin_hash'").fetchone()
+    return r["v"] if r else None
 
 
 def _pw_tag(h):
@@ -314,23 +327,49 @@ def _pw_tag(h):
     return hashlib.sha256(h.encode()).hexdigest()[:32] if h else None
 
 
-def _set_role(role, h, who=""):
+def _set_admin(h):
     session.clear()
-    session["role"] = role
-    session["tag"] = _pw_tag(h)
-    session["who"] = who
+    session["role"], session["tag"] = "admin", _pw_tag(h)
 
 
-def current_role():
-    """Роль вошедшего ("admin" / "analyst") или None. Вход действует, пока не сменён пароль этой роли."""
-    role, tag = session.get("role"), session.get("tag")
-    if role not in ROLES or not isinstance(tag, str):
-        return None
-    return role if hmac.compare_digest(tag, _pw_tag(_hash(role)) or "") else None
+def _set_user(u):
+    session.clear()
+    session["role"], session["uid"], session["tag"] = "user", u["id"], _pw_tag(u["hash"])
+
+
+def current_user():
+    """Кто вошёл: {"role": "admin"|"user", "perms": set, ...} или None.
+    Права читаются из базы при каждом запросе, поэтому их изменение действует сразу;
+    отключение, удаление пользователя или смена его пароля закрывают его входы."""
+    if "me" in g:
+        return g.me
+    me, role, tag = None, session.get("role"), session.get("tag")
+    if isinstance(tag, str):
+        if role == "admin":
+            if hmac.compare_digest(tag, _pw_tag(admin_hash()) or ""):
+                me = {"role": "admin", "id": None, "login": "admin", "name": "Администратор", "perms": set(PERMS)}
+        elif role == "user" and isinstance(session.get("uid"), int):
+            u = db().execute("SELECT * FROM users WHERE id=? AND active=1", (session["uid"],)).fetchone()
+            if u and hmac.compare_digest(tag, _pw_tag(u["hash"])):
+                me = {"role": "user", "id": u["id"], "login": u["login"], "name": u["name"],
+                      "perms": {p for p in json.loads(u["perms"]) if p in PERMS}}
+    g.me = me
+    return me
 
 
 def is_admin():
-    return current_role() == "admin"
+    me = current_user()
+    return bool(me) and me["role"] == "admin"
+
+
+def who_label(me=None):
+    """Подпись для журнала и отметок «рассмотрено»."""
+    me = me or current_user()
+    if not me:
+        return ""
+    if me["role"] == "admin":
+        return "Администратор"
+    return "%s (%s)" % (me["name"], me["login"]) if me["name"] else me["login"]
 
 
 def _csrf_ok():
@@ -338,15 +377,21 @@ def _csrf_ok():
     return request.method in ("GET", "HEAD") or request.headers.get("X-Test-Client") == "1"
 
 
-def _role_required(*roles):
+def perm_required(*perms):
+    """Доступ, если есть хотя бы одно из прав perms. Без аргументов — любой вошедший.
+    Особое значение "admin" — только администратор."""
     def deco(f):
         @wraps(f)
         def wrapper(*a, **kw):
-            role = current_role()
-            if role is None:
+            me = current_user()
+            if me is None:
                 return jerr("Требуется вход", 401)
-            if role not in roles:
-                return jerr("Недостаточно прав: действие доступно только администратору", 403)
+            if perms == ("admin",):
+                allowed = me["role"] == "admin"
+            else:
+                allowed = not perms or bool(me["perms"] & set(perms))
+            if not allowed:
+                return jerr("Недостаточно прав для этого действия", 403)
             if not _csrf_ok():
                 return jerr("Недопустимый запрос", 400)
             return f(*a, **kw)
@@ -354,9 +399,8 @@ def _role_required(*roles):
     return deco
 
 
-# admin_required — только администратор; staff_required — администратор или Отдел анализа
-admin_required = _role_required("admin")
-staff_required = _role_required("admin", "analyst")
+admin_required = perm_required("admin")
+login_required = perm_required()
 
 
 @app.after_request
@@ -635,11 +679,13 @@ def api_acts():
 # ------------------------------------------------------------------ API админа
 @app.get("/api/admin/me")
 def admin_me():
-    role = current_role()
-    out = {"configured": admin_hash() is not None, "authed": role is not None, "role": role,
-           "role_title": ROLES.get(role), "who": session.get("who", "") if role else ""}
-    if role:
-        out["complaints_new"] = db().execute("SELECT COUNT(*) FROM complaints WHERE status='new'").fetchone()[0]
+    me = current_user()
+    out = {"configured": admin_hash() is not None, "authed": me is not None}
+    if me:
+        out.update({"role": me["role"], "login": me["login"], "name": me["name"], "who": who_label(me),
+                    "perms": [p for p in PERMS if p in me["perms"]]})
+        if "complaints" in me["perms"]:
+            out["complaints_new"] = db().execute("SELECT COUNT(*) FROM complaints WHERE status='new'").fetchone()[0]
     return jsonify(out)
 
 
@@ -658,7 +704,7 @@ def admin_setup():
     db().commit()
     if cur.rowcount == 0:
         return jerr("Пароль уже задан", 403)
-    _set_role("admin", h)
+    _set_admin(h)
     return jsonify({"ok": True})
 
 
@@ -673,22 +719,34 @@ def admin_login():
             return jerr("Слишком много попыток. Повторите через минуту", 429)
     d = request.get_json(silent=True) or {}
     pw = _s(d.get("password"))
-    who = re.sub(r"\s+", " ", _s(d.get("who")).strip())[:80]
-    # один вход для обеих ролей: роль определяется паролем (пароли ролей не могут совпадать)
-    for role in ("admin", "analyst"):
-        h = _hash(role)
+    login = _s(d.get("login")).strip().casefold()
+    if login in ("", "admin"):
+        h = admin_hash()
         if h and check_password_hash(h, pw):
             with _fails_lock:
                 _fails.pop(ip, None)
-            _set_role(role, h, who)
-            return jsonify({"ok": True, "role": role})
+            _set_admin(h)
+            return jsonify({"ok": True, "role": "admin"})
+    else:
+        u = db().execute("SELECT * FROM users WHERE login=? AND active=1", (login,)).fetchone()
+        # хеш проверяется и для несуществующего логина: по времени ответа не узнать, есть ли такой пользователь
+        if check_password_hash(u["hash"] if u else _DUMMY_HASH, pw) and u:
+            with _fails_lock:
+                _fails.pop(ip, None)
+            db().execute("UPDATE users SET last_login=? WHERE id=?", (now(), u["id"]))
+            db().commit()
+            _set_user(u)
+            return jsonify({"ok": True, "role": "user"})
     with _fails_lock:
         n, _ = _fails.get(ip, (0, 0))  # перечитать: счётчик мог измениться параллельным запросом
         n += 1
         _fails[ip] = (n, time.time() + 60 if n >= 5 else 0)
         if len(_fails) > 10000:  # не копить записи бесконечно
             _fails.clear()
-    return jerr("Неверный пароль", 401)
+    return jerr("Неверный логин или пароль", 401)
+
+
+_DUMMY_HASH = generate_password_hash(secrets.token_hex(8))
 
 
 @app.post("/api/admin/logout")
@@ -699,69 +757,115 @@ def admin_logout():
     return jsonify({"ok": True})
 
 
-def _other_role_uses(role, pw):
-    other = "analyst" if role == "admin" else "admin"
-    h = _hash(other)
-    return bool(h) and check_password_hash(h, pw)
-
-
 @app.post("/api/admin/password")
-@staff_required
+@login_required
 def admin_password():
-    """Смена собственного пароля (администратора или Отдела анализа)."""
-    role = current_role()
+    """Смена собственного пароля (администратора или пользователя)."""
+    me = current_user()
     d = request.get_json(silent=True) or {}
     old, new = _s(d.get("old")), _s(d.get("new"))
-    if not check_password_hash(_hash(role), old):
+    cur_hash = admin_hash() if me["role"] == "admin" else \
+        db().execute("SELECT hash FROM users WHERE id=?", (me["id"],)).fetchone()[0]
+    if not check_password_hash(cur_hash, old):
         return jerr("Текущий пароль неверный", 403)
     if len(new) < 6:
         return jerr("Новый пароль не короче 6 символов")
-    if _other_role_uses(role, new):
-        return jerr("Этот пароль нельзя использовать: выберите другой")
     h = generate_password_hash(new)
-    db().execute("UPDATE settings SET v=? WHERE k=?", (h, role + "_hash"))
-    db().commit()
-    _set_role(role, h, session.get("who", ""))  # этот вход остаётся, остальные сессии этой роли закрываются
+    if me["role"] == "admin":
+        db().execute("UPDATE settings SET v=? WHERE k='admin_hash'", (h,))
+        db().commit()
+        _set_admin(h)  # этот вход остаётся, остальные входы закрываются
+    else:
+        db().execute("UPDATE users SET hash=? WHERE id=?", (h, me["id"]))
+        db().commit()
+        _set_user(db().execute("SELECT * FROM users WHERE id=?", (me["id"],)).fetchone())
     return jsonify({"ok": True})
 
 
-@app.get("/api/admin/analyst")
-@admin_required
-def admin_analyst_get():
-    return jsonify({"enabled": _hash("analyst") is not None})
+# --- пользователи (только администратор)
+def _user_json(r):
+    return {"id": r["id"], "login": r["login"], "name": r["name"], "active": bool(r["active"]),
+            "perms": [p for p in PERMS if p in json.loads(r["perms"])], "created": r["created"], "last_login": r["last_login"]}
 
 
-@app.put("/api/admin/analyst")
+def _clean_perms(v):
+    if not isinstance(v, list):
+        raise ValueError("Неверный список прав")
+    return [p for p in PERMS if p in v]
+
+
+@app.get("/api/admin/users")
 @admin_required
-def admin_analyst_set():
-    """Администратор задаёт или меняет пароль Отдела анализа (все входы отдела при этом закрываются)."""
-    pw = _s((request.get_json(silent=True) or {}).get("password"))
+def admin_users():
+    rows = db().execute("SELECT * FROM users ORDER BY login").fetchall()
+    return jsonify({"items": [_user_json(r) for r in rows], "perms": list(PERMS.items())})
+
+
+@app.post("/api/admin/users")
+@admin_required
+def admin_user_create():
+    d = request.get_json(silent=True) or {}
+    login = _s(d.get("login")).strip().casefold()
+    name = re.sub(r"\s+", " ", _s(d.get("name")).strip())[:80]
+    pw = _s(d.get("password"))
+    if not LOGIN_RE.match(login) or login == "admin":
+        return jerr("Логин: от 3 до 40 букв, цифр, точек, дефисов или подчёркиваний (кроме «admin»)")
     if len(pw) < 6:
         return jerr("Пароль не короче 6 символов")
-    if _other_role_uses("analyst", pw):
-        return jerr("Пароль Отдела анализа не должен совпадать с паролем администратора")
-    db().execute("INSERT INTO settings(k,v) VALUES('analyst_hash',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                 (generate_password_hash(pw),))
-    db().commit()
-    return jsonify({"ok": True, "enabled": True})
+    try:
+        perms = _clean_perms(d.get("perms", []))
+    except ValueError as e:
+        return jerr(str(e))
+    try:
+        cur = db().execute("INSERT INTO users(login,name,hash,perms,created) VALUES(?,?,?,?,?)",
+                           (login, name, generate_password_hash(pw), json.dumps(perms), now()))
+        db().commit()
+    except sqlite3.IntegrityError:
+        return jerr("Пользователь с таким логином уже есть", 409)
+    return jsonify({"id": cur.lastrowid})
 
 
-@app.delete("/api/admin/analyst")
+@app.put("/api/admin/users/<int:uid>")
 @admin_required
-def admin_analyst_disable():
-    db().execute("DELETE FROM settings WHERE k='analyst_hash'")
+def admin_user_update(uid):
+    """Изменение имени, прав, активности или пароля (передаются только меняемые поля)."""
+    u = db().execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not u:
+        return jerr("Пользователь не найден", 404)
+    d = request.get_json(silent=True) or {}
+    name = re.sub(r"\s+", " ", _s(d.get("name")).strip())[:80] if "name" in d else u["name"]
+    try:
+        perms = _clean_perms(d["perms"]) if "perms" in d else json.loads(u["perms"])
+    except ValueError as e:
+        return jerr(str(e))
+    active = (1 if d["active"] else 0) if "active" in d else u["active"]
+    h = u["hash"]
+    if "password" in d:
+        pw = _s(d.get("password"))
+        if len(pw) < 6:
+            return jerr("Пароль не короче 6 символов")
+        h = generate_password_hash(pw)  # прежние входы пользователя закрываются
+    db().execute("UPDATE users SET name=?,perms=?,active=?,hash=? WHERE id=?", (name, json.dumps(perms), active, h, uid))
     db().commit()
-    return jsonify({"ok": True, "enabled": False})
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/admin/users/<int:uid>")
+@admin_required
+def admin_user_delete(uid):
+    db().execute("DELETE FROM users WHERE id=?", (uid,))
+    db().commit()
+    return jsonify({"ok": True})
 
 
 @app.get("/api/admin/settings")
-@admin_required
+@perm_required("settings")
 def admin_get_settings():
     return jsonify({"settings": get_settings(), "cols": COLS})
 
 
 @app.put("/api/admin/settings")
-@admin_required
+@perm_required("settings")
 def admin_put_settings():
     try:
         return jsonify({"settings": put_settings(request.get_json(silent=True) or {})})
@@ -775,7 +879,7 @@ def _block_json(r, counts):
 
 
 @app.get("/api/admin/blocks")
-@staff_required
+@perm_required("questions_edit", "questions_manage", "blocks", "settings")
 def admin_blocks():
     counts = {r[0]: r[1] for r in db().execute("SELECT block_id,COUNT(*) FROM questions GROUP BY block_id")}
     rows = db().execute("SELECT * FROM blocks ORDER BY id").fetchall()
@@ -787,7 +891,7 @@ def _clean_cols(v):
 
 
 @app.post("/api/admin/blocks")
-@admin_required
+@perm_required("blocks")
 def admin_block_create():
     d = request.get_json(silent=True) or {}
     title = _s(d.get("title")).strip()
@@ -800,7 +904,7 @@ def admin_block_create():
 
 
 @app.put("/api/admin/blocks/<int:bid>")
-@admin_required
+@perm_required("blocks")
 def admin_block_update(bid):
     d = request.get_json(silent=True) or {}
     r = db().execute("SELECT * FROM blocks WHERE id=?", (bid,)).fetchone()
@@ -814,7 +918,7 @@ def admin_block_update(bid):
 
 
 @app.delete("/api/admin/blocks/<int:bid>")
-@admin_required
+@perm_required("blocks")
 def admin_block_delete(bid):
     if db().execute("SELECT 1 FROM questions WHERE block_id=? LIMIT 1", (bid,)).fetchone():
         return jerr("В блоке есть вопросы: сначала удалите или перенесите их", 409)
@@ -840,7 +944,7 @@ def _prune_block_filter(con):
 # --- вопросы
 def _log_question(con, qid, action, before=None, after=None):
     con.execute("INSERT INTO question_log(qid,at,role,who,action,before,after) VALUES(?,?,?,?,?,?,?)",
-                (qid, now(), current_role() or "", session.get("who", ""), action,
+                (qid, now(), current_user()["role"], who_label(), action,
                  json.dumps(before, ensure_ascii=False) if before else None,
                  json.dumps(after, ensure_ascii=False) if after else None))
 
@@ -872,7 +976,7 @@ def _clean_question(d):
 
 
 @app.get("/api/admin/questions")
-@staff_required
+@perm_required(*Q_ANY)
 def admin_questions():
     block = request.args.get("block", type=int)
     text = (request.args.get("q") or "").strip().lower()
@@ -894,14 +998,14 @@ def _qnum(qid):
 
 
 @app.get("/api/admin/questions/<qid>")
-@staff_required
+@perm_required(*Q_ANY)
 def admin_question(qid):
     r = db().execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
     return jsonify(_q_json(r)) if r else jerr("Вопрос не найден", 404)
 
 
 @app.post("/api/admin/questions")
-@admin_required
+@perm_required("questions_manage")
 def admin_question_create():
     d = request.get_json(silent=True) or {}
     errs, c = _clean_question(d)
@@ -922,7 +1026,7 @@ def admin_question_create():
 
 
 @app.put("/api/admin/questions/<qid>")
-@staff_required
+@perm_required(*Q_ANY)
 def admin_question_update(qid):
     old = db().execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
     if not old:
@@ -942,7 +1046,7 @@ def admin_question_update(qid):
 
 
 @app.delete("/api/admin/questions/<qid>")
-@admin_required
+@perm_required("questions_manage")
 def admin_question_delete(qid):
     with tx() as con:
         old = con.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
@@ -952,35 +1056,41 @@ def admin_question_delete(qid):
     return jsonify({"ok": True})
 
 
+# кто сделал правку (подпись для журнала; учитывает записи прежних версий с ролью analyst)
+_BY = ("(CASE WHEN role='admin' THEN 'Администратор' WHEN who!='' THEN who "
+       "WHEN role='analyst' THEN 'Отдел анализа' ELSE role END)")
+
+
 def _log_json(r):
-    return {"id": r["id"], "qid": r["qid"], "at": r["at"], "role": r["role"], "role_title": ROLES.get(r["role"], r["role"]),
-            "who": r["who"], "action": r["action"],
+    return {"id": r["id"], "qid": r["qid"], "at": r["at"], "role": r["role"], "by": r["by"],
+            "action": r["action"],
             "before": json.loads(r["before"]) if r["before"] else None,
             "after": json.loads(r["after"]) if r["after"] else None}
 
 
 @app.get("/api/admin/questions/<qid>/history")
-@staff_required
+@perm_required(*Q_ANY)
 def admin_question_history(qid):
-    rows = db().execute("SELECT * FROM question_log WHERE qid=? ORDER BY at DESC, id DESC LIMIT 50", (qid,))
+    rows = db().execute("SELECT *, %s AS by FROM question_log WHERE qid=? ORDER BY at DESC, id DESC LIMIT 50" % _BY, (qid,))
     return jsonify({"items": [_log_json(r) for r in rows]})
 
 
 @app.get("/api/admin/question_log")
-@staff_required
+@perm_required(*Q_ANY)
 def admin_question_log():
     """Журнал изменений банка вопросов (последние записи)."""
-    role = request.args.get("role")
-    sql, args = "SELECT * FROM question_log", ()
-    if role in ROLES:
-        sql, args = sql + " WHERE role=?", (role,)
+    by = request.args.get("by")
+    sql, args = "SELECT *, %s AS by FROM question_log" % _BY, ()
+    if by:
+        sql, args = sql + " WHERE %s=?" % _BY, (by,)
     rows = db().execute(sql + " ORDER BY at DESC, id DESC LIMIT 300", args)
-    return jsonify({"items": [_log_json(r) for r in rows]})
+    people = [r[0] for r in db().execute("SELECT DISTINCT %s AS by FROM question_log ORDER BY by" % _BY)]
+    return jsonify({"items": [_log_json(r) for r in rows], "people": people})
 
 
 # --- экспорт / импорт банка
 @app.get("/api/admin/export")
-@admin_required
+@perm_required("questions_manage")
 def admin_export():
     blocks = [{"id": r["id"], "title": r["title"], "cols": json.loads(r["cols"])}
               for r in db().execute("SELECT * FROM blocks ORDER BY id")]
@@ -991,7 +1101,7 @@ def admin_export():
 
 
 @app.post("/api/admin/import")
-@admin_required
+@perm_required("questions_manage")
 def admin_import():
     mode = request.args.get("mode", "merge")
     if mode not in ("merge", "replace"):
@@ -1046,7 +1156,7 @@ def admin_import():
 
 # --- замечания участников
 @app.get("/api/admin/complaints")
-@staff_required
+@perm_required("complaints")
 def admin_complaints():
     status = request.args.get("status", "new")
     sql, args = "SELECT * FROM complaints", ()
@@ -1073,12 +1183,12 @@ def admin_complaints():
 
 
 @app.put("/api/admin/complaints/<int:cid>")
-@staff_required
+@perm_required("complaints")
 def admin_complaint_update(cid):
     st = (request.get_json(silent=True) or {}).get("status")
     if st not in ("new", "resolved"):
         return jerr("Неверный статус")
-    who = ROLES[current_role()] + (": " + session["who"] if session.get("who") else "")
+    who = who_label()
     cur = db().execute("UPDATE complaints SET status=?,handled_by=?,handled_at=? WHERE id=?",
                        (st, who if st == "resolved" else "", now() if st == "resolved" else None, cid))
     db().commit()
@@ -1086,7 +1196,7 @@ def admin_complaint_update(cid):
 
 
 @app.delete("/api/admin/complaints/<int:cid>")
-@admin_required
+@perm_required("complaints")
 def admin_complaint_delete(cid):
     db().execute("DELETE FROM complaints WHERE id=?", (cid,))
     db().commit()
@@ -1094,7 +1204,7 @@ def admin_complaint_delete(cid):
 
 
 @app.get("/api/admin/complaints.csv")
-@staff_required
+@perm_required("complaints")
 def admin_complaints_csv():
     buf = io.StringIO()
     w = csv.writer(buf, delimiter=";", quoting=csv.QUOTE_ALL)
@@ -1116,7 +1226,7 @@ def _attempt_row(r):
 
 
 @app.get("/api/admin/attempts")
-@admin_required
+@perm_required("results")
 def admin_attempts():
     _finalize_expired()
     name = _norm_name(request.args.get("name")).casefold()
@@ -1130,7 +1240,7 @@ def admin_attempts():
 
 
 @app.get("/api/admin/attempts/<aid>")
-@admin_required
+@perm_required("results")
 def admin_attempt(aid):
     a = _attempt_or_404(aid)
     if not a:
@@ -1147,7 +1257,7 @@ def admin_attempt(aid):
 
 
 @app.delete("/api/admin/attempts/<aid>")
-@admin_required
+@perm_required("results")
 def admin_attempt_delete(aid):
     db().execute("DELETE FROM attempts WHERE id=?", (aid,))
     db().commit()
@@ -1155,7 +1265,7 @@ def admin_attempt_delete(aid):
 
 
 @app.get("/api/admin/stats")
-@admin_required
+@perm_required("results")
 def admin_stats():
     _finalize_expired()
     rows = db().execute(
@@ -1176,7 +1286,7 @@ def _csv_safe(v):
 
 
 @app.get("/api/admin/results.csv")
-@admin_required
+@perm_required("results")
 def admin_csv():
     _finalize_expired()
     buf = io.StringIO()

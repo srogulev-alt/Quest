@@ -45,13 +45,13 @@ async function gate(){
   catch(e){ $("app").innerHTML = `<p class="err">${esc(e.message)}. Обновите страницу.</p>`; return; }
   if (!me.configured) return setupScreen();
   if (!me.authed) return loginScreen();
-  ROLE = me.role; NEWC = me.complaints_new || 0;
-  $("h1").textContent = ROLE === "admin" ? "Администратор теста" : "Отдел анализа: вопросы и замечания";
+  ROLE = me.role; PERMS = new Set(me.perms); NEWC = me.complaints_new || 0;
+  $("h1").textContent = ROLE === "admin" ? "Администратор теста" : "Панель теста";
   document.title = $("h1").textContent;
   $("tabs").hidden = false;
-  $("who").innerHTML = `${esc(me.role_title)}${me.who ? " · " + esc(me.who) : ""} <button id="out">Выйти</button>`;
+  $("who").innerHTML = `${esc(me.name || me.login)}${ROLE === "user" && me.name ? ` <span class="small">(${esc(me.login)})</span>` : ""} <button id="out">Выйти</button>`;
   $("out").onclick = async () => { await api("/api/admin/logout","POST",{}); gate(); };
-  show("q");
+  show(tabs()[0][0]);
 }
 function setupScreen(){
   $("app").innerHTML = `<div class="start"><h2>Первый запуск: задайте пароль администратора</h2>
@@ -65,32 +65,43 @@ function setupScreen(){
   };
 }
 function loginScreen(){
-  $("app").innerHTML = `<div class="start"><h2>Вход для администратора и Отдела анализа</h2>
-    <p class="note">Введите свой пароль: администратора или Отдела анализа. Права определяются паролем.</p><div class="box">
+  $("app").innerHTML = `<div class="start"><h2>Вход в панель теста</h2>
+    <p class="note">Пользователь входит со своим логином и паролем, которые выдал администратор. Администратор вводит логин <b>admin</b> или оставляет поле пустым.</p><div class="box">
+    <label class="f" for="ll">Логин</label><input type="text" id="ll" maxlength="40" autocomplete="username" autocapitalize="none" spellcheck="false">
     <label class="f" for="lp">Пароль</label><input type="password" id="lp" autocomplete="current-password">
-    <label class="f" for="lw">Ваше имя <span class="small">(необязательно, для журнала изменений)</span></label><input type="text" id="lw" maxlength="80" autocomplete="name">
     <div class="err" id="msg" role="alert"></div><div class="row"><button class="primary" id="ok">Войти</button></div></div></div>`;
-  const go = async () => { try { await api("/api/admin/login","POST",{password:$("lp").value, who:$("lw").value}); gate(); } catch(e){ msg(e.message); $("lp").value=""; $("lp").focus(); } };
-  $("lw").value = (() => { try { return localStorage.getItem("plenum-staff-name") || ""; } catch(e){ return ""; } })();
-  $("lw").onchange = () => { try { localStorage.setItem("plenum-staff-name", $("lw").value.trim()); } catch(e){} };
-  $("lw").onkeydown = e => { if (e.key === "Enter") go(); };
-  $("ok").onclick = go; $("lp").onkeydown = e => { if (e.key === "Enter") go(); }; $("lp").focus();
+  const go = async () => { try { await api("/api/admin/login","POST",{login:$("ll").value, password:$("lp").value}); gate(); } catch(e){ msg(e.message); $("lp").value=""; $("lp").focus(); } };
+  $("ok").onclick = go;
+  $("ll").onkeydown = e => { if (e.key === "Enter") $("lp").focus(); };
+  $("lp").onkeydown = e => { if (e.key === "Enter") go(); };
+  $("ll").focus();
 }
 
 /* ---------- вкладки ---------- */
-// вкладки по ролям: Отделу анализа доступны только вопросы (правка) и замечания участников
-const TABS = {
-  admin:   [["q","Вопросы"],["b","Коллегии и блоки"],["s","Настройки"],["r","Результаты"],["c","Замечания"],["l","Журнал изменений"]],
-  analyst: [["q","Вопросы"],["c","Замечания"],["l","Журнал изменений"],["p","Пароль"]],
-};
+// вкладка видна, если есть право (null — видна всем вошедшим; "admin" — только администратору).
+// Сервер проверяет права сам, интерфейс лишь не показывает недоступное.
+const TABS = [
+  ["q","Вопросы",          ["questions_edit","questions_manage"]],
+  ["b","Коллегии и блоки", ["blocks"]],
+  ["s","Настройки",        ["settings"]],
+  ["r","Результаты",       ["results"]],
+  ["c","Замечания",        ["complaints"]],
+  ["l","Журнал изменений", ["questions_edit","questions_manage"]],
+  ["u","Пользователи",     "admin"],
+  ["p","Пароль",           null],
+];
 let NEWC = 0;   // новых замечаний участников (число на вкладке)
-let ROLE = null;
+let ROLE = null, PERMS = new Set();
 const isAdmin = () => ROLE === "admin";
+const can = p => PERMS.has(p);
+const canQ = () => can("questions_edit") || can("questions_manage");
+const tabs = () => TABS.filter(([,,need]) => need === null || (need === "admin" ? isAdmin() : need.some(can)));
 function show(t){
-  $("tabs").innerHTML = TABS[ROLE].map(([k,n]) => `<button data-t="${k}" class="${k===t?"on":""}">${n}${k==="c"&&NEWC?` <span class="badge" id="newc">${NEWC}</span>`:""}</button>`).join("") +
+  const list = tabs();
+  $("tabs").innerHTML = list.map(([k,n]) => `<button data-t="${k}" class="${k===t?"on":""}">${n}${k==="c"&&NEWC?` <span class="badge" id="newc">${NEWC}</span>`:""}</button>`).join("") +
     `<a class="right" href="/" target="_blank" rel="noopener"><button>Открыть тест ↗</button></a>`;
   document.querySelectorAll("#tabs [data-t]").forEach(b => b.onclick = () => show(b.dataset.t));
-  ({q:qList,b:blocksScreen,s:settingsScreen,r:resultsScreen,c:complaintsScreen,l:logScreen,p:pwScreen})[t]()
+  ({q:qList,b:blocksScreen,s:settingsScreen,r:resultsScreen,c:complaintsScreen,l:logScreen,u:usersScreen,p:pwScreen})[t]()
     .catch(e => { if (e.message !== "Требуется вход") $("app").innerHTML = `<p class="err">${esc(e.message)}</p>`; });
 }
 
@@ -102,11 +113,11 @@ async function qList(){
   const p = new URLSearchParams({limit:100, offset:QF.offset}); if (QF.block) p.set("block", QF.block); if (QF.q) p.set("q", QF.q);
   const r = await api("/api/admin/questions?" + p);
   $("app").innerHTML = `<h2>Вопросы</h2>
-    ${isAdmin() ? `<div class="ed-top"><button class="primary" id="add">Добавить вопрос</button>
+    ${can("questions_manage") ? `<div class="ed-top"><button class="primary" id="add">Добавить вопрос</button>
       <a href="/api/admin/export"><button>Экспорт JSON</button></a>
       <button id="imp">Импорт (объединить)</button><button id="impAll">Импорт (заменить всё)</button>
       <input type="file" id="file" accept=".json,application/json" hidden></div>`
-      : `<p class="note">Можно править формулировки, варианты, правильный ответ, ссылку на постановление и пояснение. Добавлять и удалять вопросы может администратор. Все правки попадают в журнал изменений.</p>`}
+      : `<p class="note">Можно править формулировки, варианты, правильный ответ, ссылку на постановление и пояснение. Добавление и удаление вопросов требует отдельного права. Все правки попадают в журнал изменений.</p>`}
     <div class="ed-top"><input type="search" id="srch" placeholder="Поиск по тексту, акту, номеру" value="${esc(QF.q)}">
       <select id="blk"><option value="0">Все блоки</option>${BLOCKS.map(b=>`<option value="${b.id}">${b.id}. ${esc(b.title)} (${b.n})</option>`).join("")}</select></div>
     <p class="note">Найдено: ${r.total}${r.total>QF.offset+100?`. Показано ${QF.offset+1}–${QF.offset+100}`:""}</p>
@@ -119,7 +130,7 @@ async function qList(){
   document.querySelectorAll("[data-e]").forEach(b => b.onclick = () => qForm(b.dataset.e));
   if ($("pv")) $("pv").onclick = () => { QF.offset -= 100; qList(); };
   if ($("nx")) $("nx").onclick = () => { QF.offset += 100; qList(); };
-  if (!isAdmin()) return;
+  if (!can("questions_manage")) return;
   $("add").onclick = () => qForm(null);
   let mode = "merge";
   $("imp").onclick = () => { mode = "merge"; $("file").click(); };
@@ -144,7 +155,7 @@ async function qForm(id, back){
     <label class="f" for="fp">Пункт</label><input type="text" id="fp" value="${esc(q.p)}">
     <label class="f" for="fe">Пояснение к ответу</label><textarea id="fe" rows="4">${esc(q.e)}</textarea>
     <div class="err" id="msg" role="alert"></div>
-    <div class="row"><button class="primary" id="save">Сохранить вопрос</button><button id="cancel">Отмена</button>${id&&isAdmin()?`<button class="danger" id="del">Удалить</button>`:""}</div></div>
+    <div class="row"><button class="primary" id="save">Сохранить вопрос</button><button id="cancel">Отмена</button>${id&&can("questions_manage")?`<button class="danger" id="del">Удалить</button>`:""}</div></div>
     ${id ? `<h3>История изменений</h3><div id="hist"><p class="note">Загрузка…</p></div>` : ""}`;
   if (id) api("/api/admin/questions/" + encodeURIComponent(id) + "/history")
     .then(h => { $("hist").innerHTML = h.items.length ? h.items.map(x => logEntry(x, false)).join("") : `<p class="note">Изменений через панель пока не было.</p>`; })
@@ -202,26 +213,13 @@ async function settingsScreen(){
     <label class="f">Блоки вопросов (ничего не отмечено — все)</label>
     ${BLOCKS.map(b=>`<div class="chk"><input type="checkbox" class="s-b" id="sb-${b.id}" value="${b.id}" ${s.blocks.includes(b.id)?"checked":""}><label for="sb-${b.id}">${b.id}. ${esc(b.title)} (${b.n})</label></div>`).join("")}
     <div id="msg" role="alert"></div><div class="row"><button class="primary" id="save">Сохранить настройки</button></div></div>
-    <h3>Доступ Отдела анализа</h3><div class="box" style="max-width:520px" id="an"><p class="note">Загрузка…</p></div>
-    <h3>Смена пароля администратора</h3>${pwBoxHtml()}`;
-  pwBoxInit(); analystBox();
+`;
   $("s-v").value = s.review;
   $("save").onclick = async () => {
     const body = {open:$("s-open").checked, title:$("s-t").value, count:$("s-c").value, minutes:$("s-m").value, max_attempts:$("s-a").value, review:$("s-v").value,
       cols:[...document.querySelectorAll(".s-cl:checked")].map(x=>x.value), blocks:[...document.querySelectorAll(".s-b:checked")].map(x=>+x.value)};
     try { await api("/api/admin/settings","PUT",body); msg("Настройки сохранены. Они действуют для новых попыток.", true); } catch(e){ msg(e.message); }
   };
-}
-async function analystBox(){
-  const r = await api("/api/admin/analyst");
-  $("an").innerHTML = `<p>${r.enabled ? "Доступ <b>открыт</b>." : "Доступ <b>закрыт</b>: пароль не задан."}</p>
-    <p class="note">Отдел анализа входит на эту же страницу своим паролем и может только править вопросы и работать с замечаниями участников. Настройки, результаты участников, блоки, импорт и удаление ему недоступны. При смене пароля все входы отдела закрываются.</p>
-    <label class="f" for="anp">${r.enabled ? "Новый пароль Отдела анализа" : "Пароль Отдела анализа"} (не короче 6 символов)</label><input type="password" id="anp" autocomplete="new-password">
-    <div id="anmsg" role="alert"></div>
-    <div class="row"><button class="primary" id="anset">${r.enabled ? "Сменить пароль" : "Открыть доступ"}</button>${r.enabled ? `<button class="danger" id="anoff">Закрыть доступ</button>` : ""}</div>`;
-  const m = (t, ok) => { $("anmsg").className = ok ? "note" : "err"; $("anmsg").textContent = t; };
-  $("anset").onclick = async () => { try { await api("/api/admin/analyst","PUT",{password:$("anp").value}); await analystBox(); m("Пароль Отдела анализа сохранён. Передайте его сотрудникам отдела.", true); } catch(e){ m(e.message); } };
-  if ($("anoff")) $("anoff").onclick = async () => { if (confirm("Закрыть доступ Отдела анализа? Все входы отдела перестанут действовать.")){ await api("/api/admin/analyst","DELETE"); await analystBox(); m("Доступ закрыт.", true); } };
 }
 function pwBoxHtml(){
   return `<div class="box" style="max-width:420px"><label class="f" for="o">Текущий пароль</label><input type="password" id="o" autocomplete="current-password">
@@ -234,8 +232,67 @@ function pwBoxInit(){
     catch(e){ m.className="err"; m.textContent=e.message; } };
 }
 async function pwScreen(){
-  $("app").innerHTML = `<h2>Смена пароля Отдела анализа</h2><p class="note">Пароль общий для отдела: после смены сообщите его коллегам, их открытые входы закроются. Если пароль забыт, его может задать администратор.</p>${pwBoxHtml()}`;
+  $("app").innerHTML = `${tabs().length === 1 ? `<div class="item miss"><b>Права не выданы.</b> Администратор ещё не открыл вам доступ к разделам панели; пока можно только сменить пароль.</div>` : ""}
+    <h2>Смена пароля</h2><p class="note">${isAdmin()
+    ? "Пароль администратора. Если он забыт, его можно задать на сервере командой <code>python reset_admin.py НОВЫЙ_ПАРОЛЬ</code>."
+    : "Ваш личный пароль. Если он забыт, новый может задать администратор."} Другие открытые входы с прежним паролем закроются.</p>${pwBoxHtml()}`;
   pwBoxInit();
+}
+
+/* ---------- пользователи (только администратор) ---------- */
+async function usersScreen(){
+  const r = await api("/api/admin/users");
+  const P = r.perms;   // [[код, название], ...]
+  const short = {questions_edit:"Правка вопросов", questions_manage:"Добавление и удаление вопросов, импорт", blocks:"Блоки",
+                 complaints:"Замечания", results:"Результаты", settings:"Настройки"};
+  $("app").innerHTML = `<h2>Пользователи</h2>
+    <p class="note">У каждого пользователя свой логин и пароль. Отметьте, что ему доступно; изменения прав сохраняются сразу и действуют без повторного входа.
+      Управлять пользователями может только администратор. Любое право на вопросы даёт их просмотр и доступ к журналу изменений.</p>
+    ${r.items.length ? `<div style="overflow-x:auto"><table class="users"><thead><tr><th>Пользователь</th>${P.map(([k,t]) => `<th title="${esc(t)}">${esc(short[k] || t)}</th>`).join("")}<th>Вход разрешён</th><th></th></tr></thead><tbody>
+      ${r.items.map(u => `<tr${u.active?"":` class="off"`}><td><b>${esc(u.login)}</b>${u.name?`<br>${esc(u.name)}`:""}<div class="small">${u.last_login?"последний вход "+fmtT(u.last_login):"ещё не входил"}</div></td>
+        ${P.map(([k,t]) => `<td><input type="checkbox" data-u="${u.id}" data-p="${k}" aria-label="${esc(t)}: ${esc(u.login)}" ${u.perms.includes(k)?"checked":""}></td>`).join("")}
+        <td><input type="checkbox" data-ua="${u.id}" aria-label="Вход разрешён: ${esc(u.login)}" ${u.active?"checked":""}></td>
+        <td style="white-space:nowrap"><button data-un="${u.id}">Имя</button> <button data-up="${u.id}">Пароль</button> <button class="danger" data-ud="${u.id}" data-l="${esc(u.login)}">Удалить</button></td></tr>`).join("")}
+    </tbody></table></div>` : `<p class="note">Пользователей пока нет.</p>`}
+    <div id="msg" role="alert"></div>
+    <h3>Новый пользователь</h3>
+    <div class="box" style="max-width:560px">
+      <label class="f" for="nu-l">Логин <span class="small">(латиница или кириллица, цифры, точка, дефис; 3–40 символов)</span></label><input type="text" id="nu-l" maxlength="40" autocapitalize="none" spellcheck="false">
+      <label class="f" for="nu-n">Имя и отдел <span class="small">(для журнала изменений)</span></label><input type="text" id="nu-n" maxlength="80" placeholder="например, Петрова А. В., Отдел анализа">
+      <label class="f" for="nu-p">Пароль <span class="small">(не короче 6 символов; передайте его пользователю)</span></label><input type="text" id="nu-p" autocomplete="off">
+      <div class="row" style="margin:6px 0"><button id="nu-gen">Сгенерировать пароль</button></div>
+      <label class="f">Права</label>
+      ${P.map(([k,t]) => `<div class="chk"><input type="checkbox" class="nu-pr" id="nu-${k}" value="${k}"><label for="nu-${k}">${esc(t)}</label></div>`).join("")}
+      <div class="err" id="nu-msg" role="alert"></div>
+      <div class="row"><button class="primary" id="nu-add">Добавить пользователя</button></div>
+    </div>`;
+  const put = async (id, body, ok) => { try { await api("/api/admin/users/" + id, "PUT", body); if (ok) msg(ok, true); } catch(e){ msg(e.message); await usersScreen(); } };
+  document.querySelectorAll("[data-u]").forEach(el => el.onchange = () => {
+    const id = el.dataset.u;
+    put(id, {perms: [...document.querySelectorAll(`[data-u="${id}"]:checked`)].map(x => x.dataset.p)}, "Права сохранены.");
+  });
+  document.querySelectorAll("[data-ua]").forEach(el => el.onchange = async () => { await put(el.dataset.ua, {active: el.checked}, el.checked ? "Вход разрешён." : "Вход запрещён, открытые входы пользователя закрыты."); el.closest("tr").classList.toggle("off", !el.checked); });
+  document.querySelectorAll("[data-un]").forEach(b => b.onclick = async () => {
+    const u = r.items.find(x => x.id === +b.dataset.un), v = prompt("Имя и отдел пользователя " + u.login, u.name);
+    if (v !== null){ await put(u.id, {name: v}); usersScreen(); }
+  });
+  document.querySelectorAll("[data-up]").forEach(b => b.onclick = async () => {
+    const u = r.items.find(x => x.id === +b.dataset.up), v = prompt("Новый пароль для " + u.login + " (не короче 6 символов). Открытые входы пользователя закроются.", genPw());
+    if (v !== null) put(u.id, {password: v}, `Пароль для ${u.login} изменён: ${v}`);
+  });
+  document.querySelectorAll("[data-ud]").forEach(b => b.onclick = async () => {
+    if (confirm(`Удалить пользователя ${b.dataset.l}? Его правки в журнале сохранятся.`)){ await api("/api/admin/users/" + b.dataset.ud, "DELETE"); usersScreen(); }
+  });
+  $("nu-gen").onclick = () => { $("nu-p").value = genPw(); };
+  $("nu-add").onclick = async () => {
+    const body = {login:$("nu-l").value, name:$("nu-n").value, password:$("nu-p").value, perms:[...document.querySelectorAll(".nu-pr:checked")].map(x => x.value)};
+    try { await api("/api/admin/users","POST",body); await usersScreen(); msg(`Пользователь ${body.login.trim().toLowerCase()} добавлен. Пароль: ${body.password}`, true); }
+    catch(e){ $("nu-msg").textContent = e.message; }
+  };
+}
+function genPw(){
+  const a = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789", b = new Uint32Array(10);
+  crypto.getRandomValues(b); return [...b].map(x => a[x % a.length]).join("");
 }
 
 /* ---------- журнал изменений вопросов ---------- */
@@ -248,7 +305,7 @@ function fieldText(k, v){
   return String(v);
 }
 function logEntry(x, withOpen = true){
-  const by = esc(x.role_title) + (x.who ? " · " + esc(x.who) : "");
+  const by = esc(x.by);
   let body = "";
   if (x.action === "update"){
     const ch = FIELDS.filter(([k]) => JSON.stringify(x.before[k]) !== JSON.stringify(x.after[k]));
@@ -262,10 +319,10 @@ function logEntry(x, withOpen = true){
 }
 let LF = "";
 async function logScreen(){
-  const r = await api("/api/admin/question_log" + (LF ? "?role=" + LF : ""));
+  const r = await api("/api/admin/question_log" + (LF ? "?by=" + encodeURIComponent(LF) : ""));
   $("app").innerHTML = `<h2>Журнал изменений вопросов</h2>
     <p class="note">Правки, сделанные через панель (последние 300). Нажмите на запись, чтобы увидеть, что было и что стало. Импорт банка из файла в журнал не записывается.</p>
-    <div class="ed-top"><select id="lf"><option value="">Все</option><option value="analyst">Отдел анализа</option><option value="admin">Администратор</option></select></div>
+    <div class="ed-top"><select id="lf" aria-label="Кто вносил правки"><option value="">Все</option>${r.people.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join("")}</select></div>
     ${r.items.length ? r.items.map(x => logEntry(x)).join("") : `<p class="note">Записей нет.</p>`}`;
   $("lf").value = LF; $("lf").onchange = e => { LF = e.target.value; logScreen(); };
   bindLogButtons(logScreen);
@@ -323,9 +380,9 @@ async function complaintsScreen(){
       <p class="qq" style="margin-top:10px">${esc(s.q)}</p>
       ${s.options.map((o,i) => `<p class="ans">${i===s.correct?"<b class=\"ok\">":""}${LET[i]}) ${esc(o)}${i===s.correct?" — правильный</b>":""}${i===s.chosen?" <span class=\"badge\">ответ участника</span>":""}</p>`).join("")}
       <p class="ref">${esc(s.act)}${s.pt ? ", " + esc(s.pt) : ""}</p>
-      <div class="row" style="margin:8px 0 0">${c.q_state!=="deleted" ? `<button data-qe="${esc(c.qid)}">Открыть вопрос</button>` : ""}
+      <div class="row" style="margin:8px 0 0">${c.q_state!=="deleted" && canQ() ? `<button data-qe="${esc(c.qid)}">Открыть вопрос</button>` : ""}
         <button data-cs="${c.id}" data-to="${c.status==="new"?"resolved":"new"}">${c.status==="new"?"Отметить рассмотренным":"Вернуть в новые"}</button>
-        ${isAdmin() ? `<button class="danger" data-cd="${c.id}">Удалить</button>` : ""}</div>
+        <button class="danger" data-cd="${c.id}">Удалить</button></div>
       ${c.status==="resolved" && c.handled_by ? `<p class="small" style="margin:6px 0 0">Рассмотрено: ${esc(c.handled_by)}, ${fmtT(c.handled_at)}</p>` : ""}</div>`; }).join("")
       : `<p class="note">${CF==="new" ? "Новых замечаний нет." : "Замечаний нет."}</p>`}`;
   $("cf").value = CF;
