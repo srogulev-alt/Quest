@@ -84,4 +84,28 @@ th{color:var(--muted);font-weight:600;font-size:.9rem}
 .right{margin-left:auto}
 td button,th button{padding:5px 9px}
 .badge{display:inline-block;padding:1px 8px;border-radius:10px;background:var(--sel);font-size:.8rem}
+.tabs button.on .badge{background:var(--sheet);color:var(--accent);font-weight:700}
 .wrap.wide{max-width:1040px}
+
+/* замечания к вопросам */
+.cmp{margin-top:10px}
+.cmp .linkbtn{padding:5px 10px;font-size:.88rem;color:var(--muted)}
+.cmp .sent{color:var(--ok);font-size:.9rem}
+.cmp-form{border-top:1px dashed var(--rule);margin-top:10px;padding-top:10px}
+.cmp-form textarea{width:100%;min-height:72px;resize:vertical;margin-top:8px}
+.cmp-form .chk{margin:6px 0;align-items:flex-start}
+.cmp-form .chk input{margin-top:3px;flex:none}
+details.qlist{margin:16px 0}
+details.qlist summary{cursor:pointer;font-weight:600}
+/* список постановлений */
+dialog{background:var(--sheet);color:var(--ink);border:1px solid var(--rule);border-radius:10px;padding:0;
+  width:calc(100% - 32px);max-width:780px;max-height:86vh}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+.dlg-head{position:sticky;top:0;background:var(--sheet);padding:16px 16px 8px;border-bottom:1px solid var(--rule)}
+.dlg-head h2{margin:0 0 8px;font-size:1.25rem}
+.dlg-head .ed-top{margin:8px 0 0}
+.dlg-body{padding:8px 16px 16px}
+.acts{margin:0;padding-left:1.6em}
+.acts li{margin:0 0 10px;line-height:1.4}
+.acts .n{color:var(--muted);font-size:.85rem;white-space:nowrap}
+.acts h3{font-size:1rem;margin:14px 0 8px;color:var(--muted)}

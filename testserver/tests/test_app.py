@@ -113,6 +113,62 @@ class AppTests(unittest.TestCase):
         bad = {"blocks": data["blocks"], "questions": [dict(data["questions"][0], o=["а", "б", "в"])]}
         self.assertEqual(c.post("/api/admin/import?mode=merge", json=bad, headers=H).status_code, 400)
 
+    def test_mix_title(self):
+        cols = {c["id"]: c["title"] for c in self.client.get("/api/public").get_json()["cols"]}
+        self.assertEqual(cols["mix"], "Все темы")
+
+    def test_acts_list(self):
+        r = self.client.get("/api/acts").get_json()
+        acts = r["acts"]
+        self.assertGreater(len(acts), 0)
+        self.assertEqual(len({a["act"] for a in acts}), len(acts))          # без повторов
+        con_total = sum(a["n"] for a in acts)
+        pub = {c["id"]: c["n"] for c in self.client.get("/api/public").get_json()["cols"]}
+        self.assertEqual(con_total, pub["mix"])                              # каждый вопрос учтён один раз
+        bank_only = [a for a in acts if a["cols"] == ["mix", "bank"]]
+        self.assertTrue(bank_only)
+        self.assertTrue(all("Пленум" in a["act"] for a in acts))
+        # ВС РФ идут раньше ВАС РФ
+        vas = [("ВАС" in a["act"][:40]) for a in acts]
+        self.assertEqual(vas, sorted(vas))
+
+    def test_complaints(self):
+        c = self.mod.app.test_client()
+        st = c.post("/api/start", json={"name": "Жалобин Иван", "col": "civ"}).get_json()
+        aid = st["attempt_id"]
+        url = "/api/attempt/%s/complaint" % aid
+        # до завершения теста нельзя
+        self.assertEqual(c.post(url, json={"idx": 0, "kind": "answer"}).status_code, 409)
+        res = c.post("/api/attempt/%s/finish" % aid).get_json()
+        self.assertIn("complaint_kinds", res)
+        self.assertEqual(c.post(url, json={"idx": 0, "kind": "nope"}).status_code, 400)
+        self.assertEqual(c.post(url, json={"idx": 0, "kind": "other"}).status_code, 400)   # «другое» без описания
+        self.assertEqual(c.post(url, json={"idx": 999, "kind": "answer"}).status_code, 404)
+        self.assertEqual(c.post(url, json={"idx": 0, "kind": "answer", "comment": "x" * 2001}).status_code, 400)
+        self.assertEqual(c.post(url, json={"idx": 0, "kind": "answer"}).status_code, 200)  # описание необязательно
+        self.assertEqual(c.post(url, json={"idx": 0, "kind": "outdated", "comment": "Пункт изменён"}).status_code, 200)
+        self.assertEqual(c.post(url, json={"idx": 1, "kind": "question", "comment": "=1+1"}).status_code, 200)
+        res = c.get("/api/attempt/%s" % aid).get_json()
+        self.assertEqual(res["complaints"]["0"], {"kind": "outdated", "comment": "Пункт изменён"})
+        a = self.admin()
+        self.assertEqual(self.client.get("/api/admin/complaints").status_code, 401)
+        lst = a.get("/api/admin/complaints").get_json()
+        mine = [x for x in lst["items"] if x["snap"]["name"] == "Жалобин Иван"]
+        self.assertEqual(len(mine), 2)                                       # повторная отправка заменяет, а не дублирует
+        self.assertTrue(all(x["q_state"] == "same" for x in mine))
+        self.assertGreaterEqual(a.get("/api/admin/me").get_json()["complaints_new"], 2)
+        cid = mine[0]["id"]
+        self.assertEqual(a.put("/api/admin/complaints/%d" % cid, json={"status": "resolved"}).status_code, 400)  # без заголовка
+        self.assertEqual(a.put("/api/admin/complaints/%d" % cid, json={"status": "resolved"}, headers=H).status_code, 200)
+        self.assertIn(cid, [x["id"] for x in a.get("/api/admin/complaints?status=resolved").get_json()["items"]])
+        csv_text = a.get("/api/admin/complaints.csv").get_data(as_text=True)
+        self.assertIn("'=1+1", csv_text)                                     # защита от формул в Excel
+        # замечание переживает удаление попытки
+        a.delete("/api/admin/attempts/%s" % aid, headers=H)
+        left = [x for x in a.get("/api/admin/complaints?status=all").get_json()["items"] if x["snap"]["name"] == "Жалобин Иван"]
+        self.assertEqual(len(left), 2)
+        self.assertEqual(a.delete("/api/admin/complaints/%d" % cid, headers=H).status_code, 200)
+
 
 if __name__ == "__main__":
     unittest.main()

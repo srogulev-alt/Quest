@@ -29,7 +29,7 @@ os.makedirs(DATA, exist_ok=True)
 DB_PATH = os.path.join(DATA, "test.db")
 
 COLS = {
-    "mix": "Микс (все темы)",
+    "mix": "Все темы",
     "civ": "Гражданская коллегия",
     "adm": "Административная коллегия",
     "bank": "Банкротная коллегия",
@@ -44,6 +44,14 @@ DEFAULTS = {
     "blocks": [],         # пусто — все блоки
     "open": True,         # тест открыт для прохождения
 }
+# виды замечаний участника к вопросу после теста
+COMPLAINT_KINDS = {
+    "answer": "Неверен ответ, указанный как правильный",
+    "question": "Некорректна формулировка вопроса или вариантов",
+    "outdated": "Не соответствует действующему законодательству или практике",
+    "other": "Другое",
+}
+COMPLAINT_MAX = 2000      # символов в описании замечания
 GRACE = 3                 # секунд на доставку последнего ответа после дедлайна
 QID_RE = re.compile(r"^[\w.-]{1,40}$")   # номер вопроса: попадает в адрес /api/admin/questions/<id>
 _rnd = random.SystemRandom()
@@ -97,7 +105,14 @@ CREATE TABLE IF NOT EXISTS items(
 CREATE INDEX IF NOT EXISTS ix_attempts_name ON attempts(name_key);
 CREATE INDEX IF NOT EXISTS ix_items_qid ON items(qid);
 CREATE INDEX IF NOT EXISTS ix_attempts_open ON attempts(finished, deadline);
+CREATE TABLE IF NOT EXISTS complaints(
+  id INTEGER PRIMARY KEY, attempt_id TEXT NOT NULL, idx INTEGER NOT NULL, qid TEXT NOT NULL,
+  kind TEXT NOT NULL, comment TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'new', snap TEXT NOT NULL, UNIQUE(attempt_id, idx));
+CREATE INDEX IF NOT EXISTS ix_complaints_status ON complaints(status, created);
 """
+# Замечания намеренно не связаны внешним ключом с attempts: в snap хранится копия
+# вопроса в том виде, в каком его видел участник, и замечание переживает удаление попытки.
 
 
 def db():
@@ -438,7 +453,7 @@ def _finalize_expired():
 
 def _result(aid):
     a = _attempt_or_404(aid)
-    out = {"finished": True, "name": a["name"], "col": a["col"], "col_title": COLS.get(a["col"], a["col"]),
+    out = {"finished": True, "attempt_id": aid, "name": a["name"], "col": a["col"], "col_title": COLS.get(a["col"], a["col"]),
            "total": a["total"], "score": a["score"], "seconds": a["seconds"], "timeout": bool(a["timeout"]),
            "review": a["review"]}
     rows = db().execute("SELECT idx,snap,chosen,ok FROM items WHERE attempt_id=? ORDER BY idx", (aid,)).fetchall()
@@ -451,6 +466,11 @@ def _result(aid):
                                  "act": sn["act"], "pt": sn["pt"]})
     else:
         out["wrong"] = [r["idx"] + 1 for r in rows if not r["ok"]]
+        # тексты вопросов (без ответов) — чтобы можно было оставить замечание к любому из них
+        out["questions"] = [{"idx": r["idx"], "q": json.loads(r["snap"])["q"]} for r in rows]
+    out["complaints"] = {str(r["idx"]): {"kind": r["kind"], "comment": r["comment"]} for r in db().execute(
+        "SELECT idx,kind,comment FROM complaints WHERE attempt_id=?", (aid,))}
+    out["complaint_kinds"] = list(COMPLAINT_KINDS.items())  # списком: порядок важен, а ключи JSON сортируются
     return out
 
 
@@ -505,10 +525,82 @@ def api_finish(aid):
     return jsonify(_result(aid))
 
 
+@app.post("/api/attempt/<aid>/complaint")
+def api_complaint(aid):
+    """Замечание участника к вопросу завершённой попытки (одно на вопрос, повторная отправка его заменяет)."""
+    a = _attempt_or_404(aid)
+    if not a:
+        return jerr("Попытка не найдена", 404)
+    if not a["finished"]:
+        return jerr("Замечание можно оставить после завершения теста", 409)
+    d = request.get_json(silent=True) or {}
+    idx = _int(d.get("idx"), 0, 999)
+    kind = d.get("kind")
+    comment = _s(d.get("comment")).strip()
+    if idx is None or kind not in COMPLAINT_KINDS:
+        return jerr("Выберите, что не так с вопросом")
+    if kind == "other" and not comment:
+        return jerr("Опишите замечание")
+    if len(comment) > COMPLAINT_MAX:
+        return jerr("Описание не длиннее %d символов" % COMPLAINT_MAX)
+    it = db().execute("SELECT qid,snap,chosen FROM items WHERE attempt_id=? AND idx=?", (aid, idx)).fetchone()
+    if not it:
+        return jerr("Вопрос не найден", 404)
+    sn = json.loads(it["snap"])
+    snap = {"q": sn["q"], "options": sn["shown"], "correct": sn["correct"], "chosen": it["chosen"],
+            "act": sn["act"], "pt": sn["pt"], "name": a["name"], "col": a["col"]}
+    db().execute("INSERT INTO complaints(attempt_id,idx,qid,kind,comment,created,snap) VALUES(?,?,?,?,?,?,?) "
+                 "ON CONFLICT(attempt_id,idx) DO UPDATE SET kind=excluded.kind,comment=excluded.comment,"
+                 "created=excluded.created,status='new'",
+                 (aid, idx, it["qid"], kind, comment, now(), json.dumps(snap, ensure_ascii=False)))
+    db().commit()
+    return jsonify({"ok": True})
+
+
+_ACT_RE = re.compile(r"от (\d{2})\.(\d{2})\.(\d{4}) № (\d+)")
+
+
+def _act_sort_key(act):
+    """ВС РФ раньше ВАС РФ, внутри — от новых к старым."""
+    m = _ACT_RE.search(act)
+    date = (int(m.group(3)), int(m.group(2)), int(m.group(1)), int(m.group(4))) if m else (0, 0, 0, 0)
+    court = 1 if "ВАС" in act[:40] else 0
+    return (court, tuple(-x for x in date), act)
+
+
+@app.get("/api/acts")
+def api_acts():
+    """Постановления, по которым составлены вопросы теста (с учётом настроек администратора)."""
+    s = get_settings()
+    blocks = set(s["blocks"])
+    allowed = [c for c in COLS if c in s["cols"]]
+    by_block = {}
+    for r in db().execute("SELECT id,cols FROM blocks"):
+        if blocks and r["id"] not in blocks:
+            continue
+        bc = json.loads(r["cols"])
+        cols = [c for c in allowed if c == "mix" or c in bc]
+        if cols:
+            by_block[r["id"]] = cols
+    acts = {}
+    for r in db().execute("SELECT block_id, act, COUNT(*) n FROM questions WHERE act!='' GROUP BY block_id, act"):
+        if r["block_id"] not in by_block:
+            continue
+        x = acts.setdefault(r["act"], {"act": r["act"], "n": 0, "cols": set()})
+        x["n"] += r["n"]
+        x["cols"].update(by_block[r["block_id"]])
+    out = [{"act": x["act"], "n": x["n"], "cols": [c for c in COLS if c in x["cols"]]}
+           for x in sorted(acts.values(), key=lambda x: _act_sort_key(x["act"]))]
+    return jsonify({"acts": out, "cols": [[c, COLS[c]] for c in allowed]})
+
+
 # ------------------------------------------------------------------ API админа
 @app.get("/api/admin/me")
 def admin_me():
-    return jsonify({"configured": admin_hash() is not None, "authed": is_admin()})
+    out = {"configured": admin_hash() is not None, "authed": is_admin()}
+    if out["authed"]:
+        out["complaints_new"] = db().execute("SELECT COUNT(*) FROM complaints WHERE status='new'").fetchone()[0]
+    return jsonify(out)
 
 
 @app.post("/api/admin/setup")
@@ -823,6 +915,67 @@ def admin_import():
             added += not exists
         _prune_block_filter(con)
     return jsonify({"added": added, "updated": updated})
+
+
+# --- замечания участников
+@app.get("/api/admin/complaints")
+@admin_required
+def admin_complaints():
+    status = request.args.get("status", "new")
+    sql, args = "SELECT * FROM complaints", ()
+    if status in ("new", "resolved"):
+        sql, args = sql + " WHERE status=?", (status,)
+    rows = db().execute(sql + " ORDER BY created DESC LIMIT 1000", args).fetchall()
+    current = {}
+    qids = list({r["qid"] for r in rows})
+    for i in range(0, len(qids), 500):
+        part = qids[i:i + 500]
+        for q in db().execute("SELECT id,q,opts,ans FROM questions WHERE id IN (%s)" % _in(len(part)), part):
+            current[q["id"]] = q
+    items = []
+    for r in rows:
+        sn = json.loads(r["snap"])
+        cur = current.get(r["qid"])
+        items.append({"id": r["id"], "qid": r["qid"], "kind": r["kind"], "kind_title": COMPLAINT_KINDS.get(r["kind"], r["kind"]),
+                      "comment": r["comment"], "created": r["created"], "status": r["status"], "snap": sn,
+                      # вопрос удалён или с тех пор изменён администратором
+                      "q_state": "deleted" if cur is None else ("same" if cur["q"] == sn["q"] else "changed")})
+    counts = {r[0]: r[1] for r in db().execute("SELECT status, COUNT(*) FROM complaints GROUP BY status")}
+    return jsonify({"items": items, "counts": {"new": counts.get("new", 0), "resolved": counts.get("resolved", 0)}})
+
+
+@app.put("/api/admin/complaints/<int:cid>")
+@admin_required
+def admin_complaint_update(cid):
+    st = (request.get_json(silent=True) or {}).get("status")
+    if st not in ("new", "resolved"):
+        return jerr("Неверный статус")
+    cur = db().execute("UPDATE complaints SET status=? WHERE id=?", (st, cid))
+    db().commit()
+    return jsonify({"ok": True}) if cur.rowcount else jerr("Замечание не найдено", 404)
+
+
+@app.delete("/api/admin/complaints/<int:cid>")
+@admin_required
+def admin_complaint_delete(cid):
+    db().execute("DELETE FROM complaints WHERE id=?", (cid,))
+    db().commit()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/admin/complaints.csv")
+@admin_required
+def admin_complaints_csv():
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";", quoting=csv.QUOTE_ALL)
+    w.writerow(["Дата", "Вопрос", "Замечание", "Описание", "Участник", "Статус", "Текст вопроса", "Постановление", "Пункт"])
+    for r in db().execute("SELECT * FROM complaints ORDER BY created DESC"):
+        sn = json.loads(r["snap"])
+        w.writerow([time.strftime("%d.%m.%Y %H:%M", time.localtime(r["created"])), r["qid"],
+                    COMPLAINT_KINDS.get(r["kind"], r["kind"]), _csv_safe(r["comment"]), _csv_safe(sn.get("name", "")),
+                    "новое" if r["status"] == "new" else "рассмотрено", _csv_safe(sn["q"]), sn.get("act", ""), sn.get("pt", "")])
+    return Response("\ufeff" + buf.getvalue(), mimetype="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": "attachment; filename=zamechaniya.csv"})
 
 
 # --- результаты

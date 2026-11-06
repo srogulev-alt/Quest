@@ -45,7 +45,7 @@ async function gate(){
   catch(e){ $("app").innerHTML = `<p class="err">${esc(e.message)}. Обновите страницу.</p>`; return; }
   if (!me.configured) return setupScreen();
   if (!me.authed) return loginScreen();
-  $("tabs").hidden = false; $("who").innerHTML = `<button id="out">Выйти</button>`;
+  $("tabs").hidden = false; $("who").innerHTML = `<button id="out">Выйти</button>`; NEWC = me.complaints_new || 0;
   $("out").onclick = async () => { await api("/api/admin/logout","POST",{}); gate(); };
   show("q");
 }
@@ -69,12 +69,13 @@ function loginScreen(){
 }
 
 /* ---------- вкладки ---------- */
-const TABS = [["q","Вопросы"],["b","Коллегии и блоки"],["s","Настройки"],["r","Результаты"]];
+const TABS = [["q","Вопросы"],["b","Коллегии и блоки"],["s","Настройки"],["r","Результаты"],["c","Замечания"]];
+let NEWC = 0;   // новых замечаний участников (число на вкладке)
 function show(t){
-  $("tabs").innerHTML = TABS.map(([k,n]) => `<button data-t="${k}" class="${k===t?"on":""}">${n}</button>`).join("") +
+  $("tabs").innerHTML = TABS.map(([k,n]) => `<button data-t="${k}" class="${k===t?"on":""}">${n}${k==="c"&&NEWC?` <span class="badge" id="newc">${NEWC}</span>`:""}</button>`).join("") +
     `<a class="right" href="/" target="_blank" rel="noopener"><button>Открыть тест ↗</button></a>`;
   document.querySelectorAll("#tabs [data-t]").forEach(b => b.onclick = () => show(b.dataset.t));
-  ({q:qList,b:blocksScreen,s:settingsScreen,r:resultsScreen})[t]()
+  ({q:qList,b:blocksScreen,s:settingsScreen,r:resultsScreen,c:complaintsScreen})[t]()
     .catch(e => { if (e.message !== "Требуется вход") $("app").innerHTML = `<p class="err">${esc(e.message)}</p>`; });
 }
 
@@ -112,7 +113,8 @@ async function qList(){
       await qList(); msg(`Импорт: добавлено ${r.added}, обновлено ${r.updated}.`, true); } catch(err){ msg("Не удалось импортировать: " + err.message); }
   };
 }
-async function qForm(id){
+async function qForm(id, back){
+  back = back || qList;
   await loadBlocks();
   if (!BLOCKS.length){ alert("Сначала создайте блок на вкладке «Коллегии и блоки»."); return; }
   const q = id ? await api("/api/admin/questions/" + encodeURIComponent(id)) : {id:"", b:QF.block||BLOCKS[0].id, q:"", o:["","","",""], a:0, act:"", p:"", e:""};
@@ -128,11 +130,11 @@ async function qForm(id){
     <div class="row"><button class="primary" id="save">Сохранить вопрос</button><button id="cancel">Отмена</button>${id?`<button class="danger" id="del">Удалить</button>`:""}</div></div>`;
   $("fb").value = String(q.b);
   document.querySelectorAll("input[name=corr]").forEach(r => r.onchange = () => { for (let i=0;i<4;i++) $("or"+i).classList.toggle("correct", +r.value===i && r.checked); });
-  $("cancel").onclick = qList;
-  if ($("del")) $("del").onclick = async () => { if (confirm("Удалить вопрос " + q.id + "?")){ await api("/api/admin/questions/"+encodeURIComponent(id),"DELETE"); qList(); } };
+  $("cancel").onclick = () => back();
+  if ($("del")) $("del").onclick = async () => { if (confirm("Удалить вопрос " + q.id + "?")){ await api("/api/admin/questions/"+encodeURIComponent(id),"DELETE"); back(); } };
   $("save").onclick = async () => {
     const body = {b:+$("fb").value, q:$("fq").value, o:[0,1,2,3].map(i=>$("fo"+i).value), a:+document.querySelector("input[name=corr]:checked").value, act:$("fact").value, p:$("fp").value, e:$("fe").value};
-    try { if (id) await api("/api/admin/questions/"+encodeURIComponent(id),"PUT",body); else await api("/api/admin/questions","POST",body); qList(); }
+    try { if (id) await api("/api/admin/questions/"+encodeURIComponent(id),"PUT",body); else await api("/api/admin/questions","POST",body); back(); }
     catch(e){ msg(e.message); }
   };
 }
@@ -141,13 +143,13 @@ async function qForm(id){
 async function blocksScreen(){
   const r = await api("/api/admin/blocks"); BLOCKS = r.blocks;
   $("app").innerHTML = `<h2>Коллегии и блоки</h2>
-    <p class="note">Отметьте, каким коллегиям подходит каждый блок. Вариант «Микс» включает все блоки. Изменения сохраняются сразу.</p>
+    <p class="note">Отметьте, каким коллегиям подходит каждый блок. Вариант «Все темы» включает все блоки. Изменения сохраняются сразу.</p>
     <table><thead><tr><th>№</th><th>Блок</th><th>Вопросов</th>${Object.values(COLS).map(c=>`<th>${c}</th>`).join("")}<th></th></tr></thead><tbody>
     ${BLOCKS.map(b=>`<tr><td>${b.id}</td><td><input type="text" data-t="${b.id}" value="${esc(b.title)}" style="width:100%"></td><td>${b.n}</td>
       ${Object.keys(COLS).map(c=>`<td><input type="checkbox" data-b="${b.id}" data-c="${c}" aria-label="${COLS[c]}, блок ${b.id}" ${b.cols.includes(c)?"checked":""}></td>`).join("")}
       <td>${b.n?"":`<button data-d="${b.id}" class="danger">Удалить</button>`}</td></tr>`).join("")}</tbody></table>
     <p class="note" id="sum"></p><div class="ed-top"><input type="text" id="nt" placeholder="Название нового блока" style="flex:1"><button id="addb">Добавить блок</button></div><div id="msg"></div>`;
-  const sum = () => { $("sum").textContent = `Вопросов по направлениям: микс ${r.totals.mix} · ` + Object.keys(COLS).map(c => COLS[c] + " " + BLOCKS.filter(b=>b.cols.includes(c)).reduce((s,b)=>s+b.n,0)).join(" · "); };
+  const sum = () => { $("sum").textContent = `Вопросов по направлениям: все темы ${r.totals.mix} · ` + Object.keys(COLS).map(c => COLS[c] + " " + BLOCKS.filter(b=>b.cols.includes(c)).reduce((s,b)=>s+b.n,0)).join(" · "); };
   sum();
   document.querySelectorAll("[data-b]").forEach(el => el.onchange = async () => {
     const b = BLOCKS.find(x => x.id === +el.dataset.b);
@@ -172,7 +174,7 @@ async function settingsScreen(){
     <label class="f" for="s-v">Что показывать после теста</label>
     <select id="s-v"><option value="full">Разбор: верные ответы и пояснения</option><option value="score">Только баллы и номера ошибочных вопросов</option></select>
     <label class="f">Варианты выбора при входе</label>
-    ${Object.entries({mix:"Микс (все темы)", civ:"Гражданская коллегия", adm:"Административная коллегия", bank:"Банкротная коллегия"}).map(([k,v])=>`<div class="chk"><input type="checkbox" class="s-cl" id="cl-${k}" value="${k}" ${s.cols.includes(k)?"checked":""}><label for="cl-${k}">${v}</label></div>`).join("")}
+    ${Object.entries({mix:"Все темы", civ:"Гражданская коллегия", adm:"Административная коллегия", bank:"Банкротная коллегия"}).map(([k,v])=>`<div class="chk"><input type="checkbox" class="s-cl" id="cl-${k}" value="${k}" ${s.cols.includes(k)?"checked":""}><label for="cl-${k}">${v}</label></div>`).join("")}
     <label class="f">Блоки вопросов (ничего не отмечено — все)</label>
     ${BLOCKS.map(b=>`<div class="chk"><input type="checkbox" class="s-b" id="sb-${b.id}" value="${b.id}" ${s.blocks.includes(b.id)?"checked":""}><label for="sb-${b.id}">${b.id}. ${esc(b.title)} (${b.n})</label></div>`).join("")}
     <div id="msg" role="alert"></div><div class="row"><button class="primary" id="save">Сохранить настройки</button></div></div>
@@ -198,10 +200,10 @@ async function resultsScreen(){
   $("app").innerHTML = `<h2>Результаты</h2>
     <p class="note">Попыток завершено: ${st.attempts}${st.avg!=null?`, средний результат ${st.avg}%`:""}. Результаты поступают на сервер сами, пересылать файлы не нужно.</p>
     <div class="ed-top"><input type="search" id="fn" placeholder="Фильтр по фамилии" value="${esc(RF.name)}">
-      <select id="fc"><option value="">Все направления</option><option value="mix">Микс</option>${Object.entries(COLS).map(([k,v])=>`<option value="${k}">${v}</option>`).join("")}</select>
+      <select id="fc"><option value="">Все направления</option><option value="mix">Все темы</option>${Object.entries(COLS).map(([k,v])=>`<option value="${k}">${v}</option>`).join("")}</select>
       <a href="/api/admin/results.csv"><button>Экспорт в CSV</button></a></div>
     ${r.items.length?`<table><thead><tr><th>Участник</th><th>Направление</th><th>Начало</th><th>Результат</th><th>%</th><th>Время</th><th></th></tr></thead><tbody>
-    ${r.items.map(a=>`<tr><td>${esc(a.name)}</td><td>${esc(a.col_title.replace(" (все темы)",""))}</td><td>${fmtT(a.started)}</td>
+    ${r.items.map(a=>`<tr><td>${esc(a.name)}</td><td>${esc(a.col_title)}</td><td>${fmtT(a.started)}</td>
       <td>${a.finished?`${a.score} из ${a.total}${a.timeout?" (время вышло)":""}`:`<span class="badge">не завершён</span>`}</td>
       <td>${a.finished?Math.round(a.score*100/a.total)+"%":""}</td><td>${a.finished?mmss(a.seconds):""}</td>
       <td><button data-v="${a.id}">Подробнее</button> <button class="danger" data-x="${a.id}">Удалить</button></td></tr>`).join("")}</tbody></table>`:`<p class="note">Попыток пока нет.</p>`}
@@ -221,6 +223,35 @@ async function attemptDetail(id){
       <p class="ans">Ответ: <b class="${x.ok?"ok":"bad"}">${x.chosen===null?"нет ответа":LET[x.chosen]+") "+esc(x.options[x.chosen])}</b></p>
       ${x.ok?"":`<p class="ans">Правильный: <b class="ok">${LET[x.correct]}) ${esc(x.options[x.correct])}</b></p>`}</div>`).join("")}`;
   $("back").onclick = resultsScreen;
+}
+
+/* ---------- замечания участников ---------- */
+let CF = "new";
+async function complaintsScreen(){
+  const r = await api("/api/admin/complaints?status=" + CF);
+  NEWC = r.counts.new; const b = document.querySelector('#tabs [data-t="c"]');
+  if (b) b.innerHTML = "Замечания" + (NEWC ? ` <span class="badge">${NEWC}</span>` : "");
+  const st = {deleted:"вопрос удалён", changed:"вопрос с тех пор изменён", same:""};
+  $("app").innerHTML = `<h2>Замечания участников</h2>
+    <p class="note">Участники оставляют их после теста к конкретному вопросу. Ниже вопрос показан так, как его видел участник (варианты в его порядке). Отметьте замечание рассмотренным, когда исправите вопрос или решите оставить как есть.</p>
+    <div class="ed-top"><select id="cf"><option value="new">Новые (${r.counts.new})</option><option value="resolved">Рассмотренные (${r.counts.resolved})</option><option value="all">Все (${r.counts.new + r.counts.resolved})</option></select>
+      <a href="/api/admin/complaints.csv"><button>Экспорт в CSV</button></a></div>
+    ${r.items.length ? r.items.map(c => { const s = c.snap; return `<div class="item${c.status==="new"?" miss":""}">
+      <p class="note" style="margin:0 0 6px">${fmtT(c.created)} · ${esc(s.name || "")} · вопрос <b>${esc(c.qid)}</b>${st[c.q_state] ? ` · <span class="badge">${st[c.q_state]}</span>` : ""}${c.status==="resolved" ? ` · <span class="badge">рассмотрено</span>` : ""}</p>
+      <p class="ans"><b class="bad">${esc(c.kind_title)}</b></p>
+      ${c.comment ? `<p class="ex" style="white-space:pre-wrap">«${esc(c.comment)}»</p>` : `<p class="note">Без описания.</p>`}
+      <p class="qq" style="margin-top:10px">${esc(s.q)}</p>
+      ${s.options.map((o,i) => `<p class="ans">${i===s.correct?"<b class=\"ok\">":""}${LET[i]}) ${esc(o)}${i===s.correct?" — правильный</b>":""}${i===s.chosen?" <span class=\"badge\">ответ участника</span>":""}</p>`).join("")}
+      <p class="ref">${esc(s.act)}${s.pt ? ", " + esc(s.pt) : ""}</p>
+      <div class="row" style="margin:8px 0 0">${c.q_state!=="deleted" ? `<button data-qe="${esc(c.qid)}">Открыть вопрос</button>` : ""}
+        <button data-cs="${c.id}" data-to="${c.status==="new"?"resolved":"new"}">${c.status==="new"?"Отметить рассмотренным":"Вернуть в новые"}</button>
+        <button class="danger" data-cd="${c.id}">Удалить</button></div></div>`; }).join("")
+      : `<p class="note">${CF==="new" ? "Новых замечаний нет." : "Замечаний нет."}</p>`}`;
+  $("cf").value = CF;
+  $("cf").onchange = e => { CF = e.target.value; complaintsScreen(); };
+  document.querySelectorAll("[data-qe]").forEach(b => b.onclick = () => qForm(b.dataset.qe, complaintsScreen));
+  document.querySelectorAll("[data-cs]").forEach(b => b.onclick = async () => { await api("/api/admin/complaints/"+b.dataset.cs,"PUT",{status:b.dataset.to}); complaintsScreen(); });
+  document.querySelectorAll("[data-cd]").forEach(b => b.onclick = async () => { if (confirm("Удалить замечание?")){ await api("/api/admin/complaints/"+b.dataset.cd,"DELETE"); complaintsScreen(); } });
 }
 
 gate();
