@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Тест по постановлениям Пленумов</title>
+<link rel="stylesheet" href="/static/common.css">
+</head>
+<body>
+<div class="wrap">
+  <header><h1 id="ttl">Тест по постановлениям Пленумов</h1><div class="timer" id="timer"></div></header>
+  <main id="app"><p class="note">Загрузка…</p></main>
+</div>
+<dialog id="actsDlg" aria-labelledby="actsTtl">
+  <div class="dlg-head">
+    <div class="row" style="margin:0;justify-content:space-between"><h2 id="actsTtl">Постановления в тесте</h2><button id="actsClose" aria-label="Закрыть">Закрыть</button></div>
+    <div class="ed-top"><input type="search" id="actsQ" placeholder="Поиск по названию, номеру, году"><select id="actsCol" aria-label="Направление"></select></div>
+    <p class="note" id="actsSum" style="margin:8px 0 0"></p>
+  </div>
+  <div class="dlg-body" id="actsList"></div>
+</dialog>
+<script>
+const $ = id => document.getElementById(id);
+const LET = ["А","Б","В","Г"];
+const esc = s => String(s==null?"":s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const KEY = "plenum-attempt-id";
+let CFG = null, A = null, tick = null, endAt = 0, finished = true;
+let sendQ = Promise.resolve();   // ответы уходят на сервер строго по очереди
+const ls = {   // localStorage может быть недоступен (приватный режим, запрет сайта)
+  get: k => { try { return localStorage.getItem(k); } catch(e){ return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch(e){} },
+  del: k => { try { localStorage.removeItem(k); } catch(e){} },
+};
+
+async function api(path, body){
+  const opt = {cache:"no-store"};
+  if (body !== undefined){ opt.method = "POST"; opt.headers = {"Content-Type":"application/json"}; opt.body = JSON.stringify(body); }
+  let r, j = null;
+  try { r = await fetch(path, opt); } catch(e){ throw Object.assign(new Error("Нет связи с сервером"), {net:true}); }
+  try { j = await r.json(); } catch(e){}
+  if (!r.ok) throw Object.assign(new Error((j && j.error) || ("Ошибка " + r.status)), {status:r.status, data:j});
+  return j;
+}
+
+/* ---------- старт ---------- */
+async function startScreen(msg){
+  clearInterval(tick); finished = true; $("timer").textContent = "";
+  try { CFG = await api("/api/public"); }
+  catch(e){ $("app").innerHTML = `<p class="err">${esc(e.message)}. Обновите страницу.</p>`; return; }
+  $("ttl").textContent = CFG.title; document.title = CFG.title;
+  if (!CFG.open){ $("app").innerHTML = `<div class="start"><p class="big">Тест сейчас закрыт.</p><p class="note">Обратитесь к администратору.</p></div>`; return; }
+  if (!CFG.cols.length){ $("app").innerHTML = `<div class="start"><p class="big">В тесте пока нет доступных вопросов.</p><p class="note">Обратитесь к администратору.</p></div>`; return; }
+  const last = ls.get("plenum-name") || "";
+  $("app").innerHTML = `
+    <div class="start">
+      <p class="big">Выберите направление. В тесте вопросов: ${CFG.count}, время: ${CFG.minutes} мин. Вопросы и порядок ответов подбираются случайно.</p>
+      <div class="box" style="max-width:560px">
+        ${CFG.cols.map((c,i)=>`<div class="chk"><input type="radio" name="col" id="col-${c.id}" value="${c.id}" ${i===0?"checked":""}><label for="col-${c.id}">${esc(c.title)} <span class="note">(вопросов в банке: ${c.n})</span></label></div>`).join("")}
+      </div>
+      <div class="box" style="margin-top:12px"><label class="f" for="nm">Фамилия и имя</label><input type="text" id="nm" maxlength="80" autocomplete="off" value="${esc(last)}"></div>
+      <div class="row"><button class="primary" id="go">Начать тест</button><button id="acts">Список постановлений</button></div>
+      <p class="note">Правильные ответы хранятся на сервере. Когда время выйдет, тест завершится автоматически; вопросы без ответа засчитываются как неверные.${CFG.max_attempts?` Попыток на одну фамилию: ${CFG.max_attempts}.`:""}</p>
+      <p class="err" id="err" role="alert">${esc(msg||"")}</p>
+    </div>`;
+  $("nm").onkeydown = e => { if (e.key === "Enter") $("go").click(); };
+  $("acts").onclick = () => { const sel = document.querySelector("input[name=col]:checked"); showActs(sel ? sel.value : ""); };
+  $("go").onclick = async () => {
+    const nm = $("nm").value.trim(); const sel = document.querySelector("input[name=col]:checked");
+    $("err").textContent = "";
+    if (nm.length < 3){ $("err").textContent = "Введите фамилию и имя."; return; }
+    $("go").disabled = true;
+    try {
+      const r = await api("/api/start", {name:nm, col:sel.value});
+      ls.set("plenum-name", nm); ls.set(KEY, r.attempt_id);
+      beginTest(r);
+    } catch(e){ $("err").textContent = e.message; $("go").disabled = false; }
+  };
+}
+
+/* ---------- тест ---------- */
+function beginTest(r){
+  A = {id: r.attempt_id, qs: r.questions, pos: 0}; sendQ = Promise.resolve();
+  syncTimer(r.remaining); finished = false;
+  clearInterval(tick); tick = setInterval(drawTimer, 250); drawTimer(); renderQ();
+}
+// время ведёт сервер; Date.now (а не performance.now) продолжает идти и во время
+// сна ноутбука, а при возврате на вкладку остаток сверяется с сервером
+function syncTimer(remaining){ endAt = Date.now() + remaining*1000; }
+document.addEventListener("visibilitychange", async () => {
+  if (document.hidden || finished || !A) return;
+  try {
+    const r = await api("/api/attempt/" + encodeURIComponent(A.id));
+    if (finished) return;
+    if (r.finished){ finished = true; clearInterval(tick); showResult(r); } else syncTimer(r.remaining);
+  } catch(e){}
+});
+function drawTimer(){
+  const s = Math.max(0, Math.ceil((endAt - Date.now())/1000));
+  $("timer").textContent = `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
+  $("timer").className = "timer" + (s <= 60 ? " low" : "");
+  if (s <= 0 && !finished) finish(true);
+}
+function renderQ(){
+  const t = A.qs[A.pos], n = A.qs.length;
+  $("app").innerHTML = `
+    <div class="dots">${A.qs.map((x,i)=>`<button class="dot${x.chosen!==null?" done":""}${i===A.pos?" cur":""}" data-go="${i}" aria-label="Вопрос ${i+1}">${i+1}</button>`).join("")}</div>
+    <div class="meta"><span>Вопрос ${A.pos+1} из ${n}</span><span>Ответов: ${A.qs.filter(x=>x.chosen!==null).length}</span></div>
+    <p class="q">${esc(t.q)}</p>
+    <div class="opts">${t.options.map((o,i)=>`<button class="opt${t.chosen===i?" chosen":""}" data-i="${i}"><span class="l">${LET[i]}</span><span>${esc(o)}</span></button>`).join("")}</div>
+    <p class="err" id="neterr" role="alert"></p>
+    <div class="nav"><button id="prev" ${A.pos===0?"disabled":""}>Назад</button>
+      ${A.pos===n-1?`<button id="end" class="primary">Завершить</button>`:`<button id="next" class="primary">Далее</button>`}</div>`;
+  document.querySelectorAll(".opt").forEach(b => b.onclick = () => choose(+b.dataset.i));
+  document.querySelectorAll(".dot").forEach(b => b.onclick = () => { A.pos = +b.dataset.go; renderQ(); });
+  $("prev").onclick = () => { A.pos--; renderQ(); };
+  if ($("next")) $("next").onclick = () => { A.pos++; renderQ(); };
+  if ($("end")) $("end").onclick = () => {
+    const miss = A.qs.filter(x=>x.chosen===null).length;
+    if (miss && !confirm(`Без ответа осталось вопросов: ${miss}. Завершить тест?`)) return;
+    finish(false);
+  };
+}
+function choose(i){
+  if (finished) return;
+  const t = A.qs[A.pos]; if (t.chosen === i) return;
+  t.chosen = i; t.pending = true; renderQ();
+  // очередь: при быстрой смене ответа запросы не обгоняют друг друга,
+  // и на сервере остаётся последний выбранный вариант
+  sendQ = sendQ.then(() => sendAnswer(t, true));
+}
+async function sendAnswer(t, live){
+  if (!t.pending) return;
+  const choice = t.chosen;
+  try {
+    const r = await api(`/api/attempt/${A.id}/answer`, {idx:t.idx, choice});
+    if (live && r && typeof r.remaining === "number") syncTimer(r.remaining);
+    if (t.chosen === choice) t.pending = false;
+  } catch(e){
+    if (e.status === 409){ if (live) finish(); return; }
+    const el = live && !finished && $("neterr");
+    if (el) el.textContent = "Ответ пока не отправлен на сервер: " + e.message + ". Он будет отправлен при завершении.";
+  }
+}
+async function finish(){
+  if (finished) return; finished = true; clearInterval(tick); $("timer").textContent = "";
+  $("app").innerHTML = `<p class="note">Сохранение результата…</p>`;
+  await submit();
+}
+async function submit(){
+  await sendQ;
+  // доотправить неподтверждённые ответы
+  for (const t of A.qs) await sendAnswer(t, false);
+  try { showResult(await api(`/api/attempt/${A.id}/finish`, {})); }
+  catch(e){
+    $("app").innerHTML = `<p class="err">${esc(e.message)}</p><div class="row"><button class="primary" id="retry">Повторить</button></div>`;
+    $("retry").onclick = () => { $("retry").disabled = true; submit(); };
+  }
+}
+
+/* ---------- результат ---------- */
+function showResult(r){
+  clearInterval(tick); finished = true; $("timer").textContent = "";
+  let body = "";
+  CMP = {aid: r.attempt_id, kindList: r.complaint_kinds || [], kinds: Object.fromEntries(r.complaint_kinds || []), sent: r.complaints || {}};
+  const hint = `<p class="note">Если считаете, что вопрос или правильный ответ составлены неверно, нажмите «Сообщить об ошибке» под вопросом. Замечание получит администратор.</p>`;
+  if (r.items){
+    body = hint + r.items.map((x,i) => {
+      const your = x.chosen === null ? "нет ответа" : `${LET[x.chosen]}) ${esc(x.options[x.chosen])}`;
+      return `<div class="item${x.ok?"":" miss"}">
+        <p class="qq">${i+1}. ${esc(x.q)}</p>
+        <p class="ans">Ваш ответ: <b class="${x.ok?"ok":"bad"}">${your}</b></p>
+        ${x.ok?"":`<p class="ans">Правильный ответ: <b class="ok">${LET[x.correct]}) ${esc(x.options[x.correct])}</b></p>`}
+        <p class="ex">${esc(x.expl)}</p><p class="ref">${esc(x.act)}${x.pt?", "+esc(x.pt):""}</p>
+        <div class="cmp" data-idx="${x.idx}"></div></div>`; }).join("");
+  } else {
+    body = `<p>${r.wrong.length ? "Неверно отвечены вопросы: " + r.wrong.join(", ") + "." : "Ошибок нет."}</p><p class="note">Правильные ответы в этом тесте не показываются.</p>`;
+    if (r.questions && r.questions.length)
+      body += `<details class="qlist"><summary>Вопросы теста: сообщить об ошибке</summary>${hint}${r.questions.map((x,i) =>
+        `<div class="item" style="border-left-color:var(--rule)"><p class="qq">${i+1}. ${esc(x.q)}</p><div class="cmp" data-idx="${x.idx}"></div></div>`).join("")}</details>`;
+  }
+  $("app").innerHTML = `<div class="result">
+    <p class="note">${esc(r.name)} · ${esc(r.col_title)}</p>
+    <h2>${r.score} из ${r.total}</h2>
+    <p class="sub">${r.timeout?"Время вышло. ":""}Затрачено ${Math.floor(r.seconds/60)} мин ${r.seconds%60} с. Результат сохранён на сервере.</p>
+    <div class="row"><button class="primary" id="again">Пройти ещё раз</button><button id="acts">Список постановлений</button></div>${body}</div>`;
+  $("again").onclick = () => { ls.del(KEY); A = null; startScreen(); };
+  $("acts").onclick = () => showActs(r.col);
+  document.querySelectorAll(".cmp").forEach(el => renderCmp(el));
+  window.scrollTo(0,0);
+}
+
+document.addEventListener("keydown", e => {
+  if (finished || !A) return;
+  if (["INPUT","TEXTAREA","SELECT"].includes(document.activeElement.tagName)) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key >= "1" && e.key <= "4"){ if (+e.key-1 < A.qs[A.pos].options.length) choose(+e.key-1); }
+  if (e.key === "ArrowRight" && A.pos < A.qs.length-1){ A.pos++; renderQ(); }
+  if (e.key === "ArrowLeft" && A.pos > 0){ A.pos--; renderQ(); }
+});
+
+/* ---------- замечания к вопросам ---------- */
+let CMP = null;
+function renderCmp(el, open){
+  const idx = +el.dataset.idx, sent = CMP.sent[idx];
+  if (!open){
+    el.innerHTML = sent
+      ? `<span class="sent">✓ Замечание отправлено: ${esc(CMP.kinds[sent.kind] || sent.kind)}.</span> <button class="linkbtn">Изменить</button>`
+      : `<button class="linkbtn">Сообщить об ошибке в вопросе</button>`;
+    el.querySelector("button").onclick = () => renderCmp(el, true);
+    return;
+  }
+  const kind = sent ? sent.kind : "";
+  el.innerHTML = `<div class="cmp-form" role="group" aria-label="Замечание к вопросу">
+    <b>Что не так с вопросом?</b>
+    ${CMP.kindList.map(([k,v]) => `<div class="chk"><input type="radio" name="ck-${idx}" id="ck-${idx}-${k}" value="${k}" ${k===kind?"checked":""}><label for="ck-${idx}-${k}">${esc(v)}</label></div>`).join("")}
+    <textarea maxlength="2000" placeholder="Опишите замечание (необязательно): например, какой пункт пленума или норма закона говорит иначе" aria-label="Описание замечания">${esc(sent ? sent.comment : "")}</textarea>
+    <p class="err" role="alert"></p>
+    <div class="row" style="margin:6px 0 0"><button class="primary" data-a="send">Отправить</button><button data-a="cancel">Отмена</button></div></div>`;
+  const err = el.querySelector(".err");
+  el.querySelectorAll("input[type=radio]").forEach(x => x.onchange = () => { err.textContent = ""; });
+  el.querySelector("[data-a=cancel]").onclick = () => renderCmp(el);
+  el.querySelector("[data-a=send]").onclick = async e => {
+    const k = el.querySelector(`input[name="ck-${idx}"]:checked`), comment = el.querySelector("textarea").value.trim();
+    if (!k){ err.textContent = "Выберите, что не так с вопросом."; return; }
+    if (k.value === "other" && !comment){ err.textContent = "Опишите замечание."; return; }
+    e.target.disabled = true; err.textContent = "";
+    try {
+      await api(`/api/attempt/${encodeURIComponent(CMP.aid)}/complaint`, {idx, kind:k.value, comment});
+      CMP.sent[idx] = {kind:k.value, comment}; renderCmp(el);
+    } catch(ex){ err.textContent = ex.message; e.target.disabled = false; }
+  };
+}
+
+/* ---------- список постановлений ---------- */
+let ACTS = null;
+async function showActs(col){
+  const dlg = $("actsDlg");
+  $("actsList").innerHTML = `<p class="note">Загрузка…</p>`; $("actsSum").textContent = "";
+  if (!dlg.open) dlg.showModal();
+  try { ACTS = await api("/api/acts"); }
+  catch(e){ $("actsList").innerHTML = `<p class="err">${esc(e.message)}</p>`; return; }
+  $("actsCol").innerHTML = `<option value="">Все направления</option>` +
+    ACTS.cols.filter(([k]) => k !== "mix").map(([k,v]) => `<option value="${k}">${esc(v)}</option>`).join("");
+  $("actsCol").value = col && col !== "mix" && ACTS.cols.some(([k]) => k === col) ? col : "";
+  $("actsQ").value = ""; drawActs();
+}
+function drawActs(){
+  const col = $("actsCol").value, q = $("actsQ").value.trim().toLowerCase();
+  const list = ACTS.acts.filter(a => (!col || a.cols.includes(col)) && (!q || a.act.toLowerCase().includes(q)));
+  const group = (title, xs) => xs.length ? `<h3>${title}</h3><ol class="acts">${xs.map(a =>
+    `<li>${esc(a.act)} <span class="n">— вопросов: ${a.n}</span></li>`).join("")}</ol>` : "";
+  const vas = a => a.act.slice(0, 40).includes("ВАС");
+  $("actsSum").textContent = `Постановлений: ${list.length}, вопросов по ним: ${list.reduce((s,a) => s + a.n, 0)}.`;
+  $("actsList").innerHTML = list.length
+    ? group("Пленум Верховного Суда РФ", list.filter(a => !vas(a))) + group("Пленум Высшего Арбитражного Суда РФ", list.filter(vas))
+    : `<p class="note">Ничего не найдено.</p>`;
+}
+$("actsQ").oninput = () => ACTS && drawActs();
+$("actsCol").onchange = () => ACTS && drawActs();
+$("actsClose").onclick = () => $("actsDlg").close();
+$("actsDlg").addEventListener("click", e => { if (e.target === $("actsDlg")) $("actsDlg").close(); });
+
+// предупредить, если страницу закрывают до отправки ответа на сервер
+window.addEventListener("beforeunload", e => {
+  if (A && !finished && A.qs.some(t => t.pending)){ e.preventDefault(); e.returnValue = ""; }
+});
+
+/* ---------- запуск и возобновление после обновления страницы ---------- */
+(async function boot(){
+  const id = ls.get(KEY);
+  if (id){
+    try {
+      const r = await api("/api/attempt/" + encodeURIComponent(id));
+      if (r.finished){ showResult(r); return; }
+      try { const c = await api("/api/public"); $("ttl").textContent = c.title; document.title = c.title; } catch(e){}
+      beginTest(r); return;
+    } catch(e){
+      // забываем попытку, только если сервер её не знает; при сбое сети её можно будет продолжить
+      if (e.status === 404) ls.del(KEY);
+      else if (e.net){ $("app").innerHTML = `<p class="err">${esc(e.message)}. Обновите страницу, чтобы продолжить тест.</p>`; return; }
+    }
+  }
+  startScreen();
+})();
+</script>
+</body>
+</html>
